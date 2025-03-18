@@ -15,6 +15,11 @@ export class GlobeRenderer {
     private uniformBindGroup: GPUBindGroup | null = null;
     private indexCount: number = 0;
     
+    // 缓存深度纹理
+    private depthTexture: GPUTexture | null = null;
+    private canvasWidth: number = 0;
+    private canvasHeight: number = 0;
+    
     constructor(engine: Engine, camera: Camera) {
         this.engine = engine;
         this.camera = camera;
@@ -137,7 +142,42 @@ export class GlobeRenderer {
             }
         });
         
+        // 初始化深度纹理
+        this.updateDepthTexture(device, context);
+        
         return true;
+    }
+    
+    /**
+     * 更新深度纹理（如果画布大小变化）
+     */
+    private updateDepthTexture(device: GPUDevice, context: GPUCanvasContext): void {
+        const canvas = context.canvas as HTMLCanvasElement;
+        const width = canvas.width;
+        const height = canvas.height;
+        
+        // 如果画布大小未变或尚未初始化，不需要更新
+        if (width === this.canvasWidth && height === this.canvasHeight && this.depthTexture) {
+            return;
+        }
+        
+        // 销毁旧的深度纹理
+        if (this.depthTexture) {
+            this.depthTexture.destroy();
+            this.depthTexture = null;
+        }
+        
+        // 创建新的深度纹理
+        this.depthTexture = device.createTexture({
+            label: "Depth Texture",
+            size: [width, height],
+            format: 'depth24plus',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        
+        // 更新尺寸缓存
+        this.canvasWidth = width;
+        this.canvasHeight = height;
     }
     
     /**
@@ -233,21 +273,21 @@ export class GlobeRenderer {
             return;
         }
         
+        // 检查并更新深度纹理（如果需要）
+        this.updateDepthTexture(device, context);
+        
+        if (!this.depthTexture) {
+            return;
+        }
+        
         // 更新统一变量
         this.updateUniforms(device);
-        
-        // 创建深度纹理
-        const depthTexture = device.createTexture({
-            size: [context.canvas.width, context.canvas.height],
-            format: 'depth24plus',
-            usage: GPUTextureUsage.RENDER_ATTACHMENT,
-        });
         
         // 获取当前帧的视图
         const view = context.getCurrentTexture().createView();
         
         // 创建命令编码器
-        const encoder = device.createCommandEncoder();
+        const encoder = device.createCommandEncoder({label: "Globe Render Commands"});
         
         // 开始渲染通道
         const pass = encoder.beginRenderPass({
@@ -258,7 +298,7 @@ export class GlobeRenderer {
                 storeOp: 'store',
             }],
             depthStencilAttachment: {
-                view: depthTexture.createView(),
+                view: this.depthTexture.createView(),
                 depthClearValue: 1.0,
                 depthLoadOp: 'clear',
                 depthStoreOp: 'store',
@@ -285,5 +325,39 @@ export class GlobeRenderer {
         
         // 提交命令
         device.queue.submit([encoder.finish()]);
+    }
+    
+    /**
+     * 释放渲染器资源
+     */
+    public destroy(): void {
+        const device = this.engine.getDevice();
+        if (!device) return;
+        
+        // 释放WebGPU缓冲区
+        if (this.vertexBuffer) {
+            this.vertexBuffer.destroy();
+            this.vertexBuffer = null;
+        }
+        
+        if (this.indexBuffer) {
+            this.indexBuffer.destroy();
+            this.indexBuffer = null;
+        }
+        
+        if (this.uniformBuffer) {
+            this.uniformBuffer.destroy();
+            this.uniformBuffer = null;
+        }
+        
+        // 释放深度纹理
+        if (this.depthTexture) {
+            this.depthTexture.destroy();
+            this.depthTexture = null;
+        }
+        
+        this.pipeline = null;
+        this.uniformBindGroup = null;
+        this.indexCount = 0;
     }
 } 

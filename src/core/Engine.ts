@@ -20,14 +20,14 @@ export class Engine {
         
         // 检查WebGPU支持
         if (!navigator.gpu) {
-            console.error("WebGPU不受支持");
+            console.error("WebGPU不受支持, 请使用最新版本的浏览器");
             return false;
         }
         
         // 获取GPU适配器
         const adapter = await navigator.gpu.requestAdapter();
         if (!adapter) {
-            console.error("无法获取GPU适配器");
+            console.error("无法获取GPU适配器, 请确保您的设备支持WebGPU");
             return false;
         }
         
@@ -37,7 +37,7 @@ export class Engine {
         // 配置Canvas上下文
         this.context = this.canvas.getContext('webgpu') as GPUCanvasContext;
         if (!this.context) {
-            console.error("无法创建WebGPU上下文");
+            console.error("无法创建WebGPU上下文, 请确保您的浏览器支持WebGPU");
             return false;
         }
         
@@ -71,5 +71,15 @@ export class Engine {
      */
     public getCanvas(): HTMLCanvasElement | null {
         return this.canvas;
+    }
+    
+    /**
+     * 释放引擎资源
+     */
+    public destroy(): void {
+        // 释放WebGPU资源
+        this.device = null;
+        this.context = null;
+        this.canvas = null;
     }
 } 

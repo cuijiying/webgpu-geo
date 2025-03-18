@@ -47,7 +47,7 @@ const DEFAULT_OPTIONS: AIMapOptions = {
 /**
  * AIMap类 - WebGPU地理引擎的主要入口
  */
-export class AIMap {
+export default class AIMap {
     private engine: Engine;
     private camera: Camera;
     private renderer: GlobeRenderer;
@@ -62,6 +62,16 @@ export class AIMap {
     private rotationSpeed: number = 0.01;
     private autoRotate: boolean = false;
     private autoRotateSpeed: number = 0.005;
+    
+    // 存储绑定后的事件处理函数引用
+    private boundHandleResize: (event: UIEvent) => void;
+    private boundHandleMouseDown: (event: MouseEvent) => void;
+    private boundHandleMouseMove: (event: MouseEvent) => void;
+    private boundHandleMouseUp: (event: MouseEvent) => void;
+    private boundHandleWheel: (event: WheelEvent) => void;
+    private boundHandleTouchStart: (event: TouchEvent) => void;
+    private boundHandleTouchMove: (event: TouchEvent) => void;
+    private boundHandleTouchEnd: (event: TouchEvent) => void;
     
     /**
      * 创建AIMap实例
@@ -89,6 +99,16 @@ export class AIMap {
         this.engine = new Engine();
         this.camera = new Camera();
         this.renderer = new GlobeRenderer(this.engine, this.camera);
+        
+        // 绑定事件处理函数
+        this.boundHandleResize = this.handleResize.bind(this);
+        this.boundHandleMouseDown = this.handleMouseDown.bind(this);
+        this.boundHandleMouseMove = this.handleMouseMove.bind(this);
+        this.boundHandleMouseUp = this.handleMouseUp.bind(this);
+        this.boundHandleWheel = this.handleWheel.bind(this);
+        this.boundHandleTouchStart = this.handleTouchStart.bind(this);
+        this.boundHandleTouchMove = this.handleTouchMove.bind(this);
+        this.boundHandleTouchEnd = this.handleTouchEnd.bind(this);
         
         // 设置事件监听器
         this.setupEventListeners();
@@ -125,23 +145,23 @@ export class AIMap {
      */
     private setupEventListeners(): void {
         // 窗口大小变化事件
-        window.addEventListener('resize', this.handleResize.bind(this));
+        window.addEventListener('resize', this.boundHandleResize);
         
         // 如果启用控制，设置鼠标和触摸事件
         if (this.options.enableControl) {
             // 鼠标事件
-            this.canvas.addEventListener('mousedown', this.handleMouseDown.bind(this));
-            this.canvas.addEventListener('mousemove', this.handleMouseMove.bind(this));
-            this.canvas.addEventListener('mouseup', this.handleMouseUp.bind(this));
-            this.canvas.addEventListener('mouseleave', this.handleMouseUp.bind(this));
+            this.canvas.addEventListener('mousedown', this.boundHandleMouseDown);
+            this.canvas.addEventListener('mousemove', this.boundHandleMouseMove);
+            this.canvas.addEventListener('mouseup', this.boundHandleMouseUp);
+            this.canvas.addEventListener('mouseleave', this.boundHandleMouseUp);
             
             // 鼠标滚轮事件
-            this.canvas.addEventListener('wheel', this.handleWheel.bind(this), { passive: false });
+            this.canvas.addEventListener('wheel', this.boundHandleWheel, { passive: false });
             
             // 触摸事件
-            this.canvas.addEventListener('touchstart', this.handleTouchStart.bind(this), { passive: false });
-            this.canvas.addEventListener('touchmove', this.handleTouchMove.bind(this), { passive: false });
-            this.canvas.addEventListener('touchend', this.handleTouchEnd.bind(this));
+            this.canvas.addEventListener('touchstart', this.boundHandleTouchStart, { passive: false });
+            this.canvas.addEventListener('touchmove', this.boundHandleTouchMove, { passive: false });
+            this.canvas.addEventListener('touchend', this.boundHandleTouchEnd);
         }
     }
     
@@ -204,6 +224,12 @@ export class AIMap {
      * 开始渲染循环
      */
     private startRenderLoop(): void {
+        // 确保不会创建多个渲染循环
+        if (this.animationFrameId !== null) {
+            cancelAnimationFrame(this.animationFrameId);
+            this.animationFrameId = null;
+        }
+        
         const renderFrame = () => {
             // 如果启用自动旋转
             if (this.autoRotate) {
@@ -453,18 +479,27 @@ export class AIMap {
         // 停止渲染循环
         this.stop();
         
+        // 释放WebGPU资源
+        if (this.renderer) {
+            this.renderer.destroy();
+        }
+        
+        if (this.engine) {
+            this.engine.destroy();
+        }
+        
         // 移除事件监听器
-        window.removeEventListener('resize', this.handleResize.bind(this));
+        window.removeEventListener('resize', this.boundHandleResize);
         
         if (this.options.enableControl) {
-            this.canvas.removeEventListener('mousedown', this.handleMouseDown.bind(this));
-            this.canvas.removeEventListener('mousemove', this.handleMouseMove.bind(this));
-            this.canvas.removeEventListener('mouseup', this.handleMouseUp.bind(this));
-            this.canvas.removeEventListener('mouseleave', this.handleMouseUp.bind(this));
-            this.canvas.removeEventListener('wheel', this.handleWheel.bind(this));
-            this.canvas.removeEventListener('touchstart', this.handleTouchStart.bind(this));
-            this.canvas.removeEventListener('touchmove', this.handleTouchMove.bind(this));
-            this.canvas.removeEventListener('touchend', this.handleTouchEnd.bind(this));
+            this.canvas.removeEventListener('mousedown', this.boundHandleMouseDown);
+            this.canvas.removeEventListener('mousemove', this.boundHandleMouseMove);
+            this.canvas.removeEventListener('mouseup', this.boundHandleMouseUp);
+            this.canvas.removeEventListener('mouseleave', this.boundHandleMouseUp);
+            this.canvas.removeEventListener('wheel', this.boundHandleWheel);
+            this.canvas.removeEventListener('touchstart', this.boundHandleTouchStart);
+            this.canvas.removeEventListener('touchmove', this.boundHandleTouchMove);
+            this.canvas.removeEventListener('touchend', this.boundHandleTouchEnd);
         }
     }
 } 

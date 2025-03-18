@@ -1,5 +1,5 @@
-export * from './core/Engine';
-export * from './core/Camera';
-export * from './renderers/GlobeRenderer';
+import Map from './AIMap';
 
-export * as AIMap from './AIMap'; 
+export  {
+    Map
+};

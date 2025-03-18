@@ -56,14 +56,42 @@
             <button id="go-to-europe">欧洲</button>
         </div>
     </div>
+    <!-- 或者使用本地打包后的文件 -->
+    <script src="../dist/aimap-dev.umd.cjs"></script>
     
-    <script type="module">
-        import { AIMap } from '../src/index.ts';
+    <script>
+        // 使用打包后的文件
+        // import { AIMap } from '../dist/aimap-dev.js';
+
+        console.log(ai);
         
+        
+        let map; // 全局变量，方便清理
+        let memoryCheckInterval; // 内存检查间隔
+        
+        // 添加内存监控函数
+        function logMemoryUsage() {
+            if (window.performance && window.performance.memory) {
+                console.log('内存使用情况:', {
+                    totalJSHeapSize: (window.performance.memory.totalJSHeapSize / 1024 / 1024).toFixed(2) + ' MB',
+                    usedJSHeapSize: (window.performance.memory.usedJSHeapSize / 1024 / 1024).toFixed(2) + ' MB',
+                    jsHeapSizeLimit: (window.performance.memory.jsHeapSizeLimit / 1024 / 1024).toFixed(2) + ' MB'
+                });
+            }
+        }
+        
+        // 强制进行垃圾回收（仅在开发环境中使用）
+        function forceGC() {
+            if (window.gc) {
+                window.gc();
+                console.log('手动垃圾回收已执行');
+            }
+        }
+
         async function main() {
             try {
                 // 创建AIMap实例
-                const map = new AIMap('webgpu-canvas', {
+                map = new ai.Map('webgpu-canvas', {
                     zoom: 1,
                     center: [0, 0],
                     enableControl: true
@@ -102,6 +130,11 @@
                     map.setCenter(10, 50);
                 });
                 
+                // 启动内存监控（仅开发环境）
+                memoryCheckInterval = setInterval(() => {
+                    logMemoryUsage();
+                }, 10000); // 每10秒记录一次
+                
             } catch (error) {
                 console.error("初始化失败:", error);
                 document.body.innerHTML = `
@@ -113,6 +146,24 @@
                 `;
             }
         }
+        
+        // 页面卸载时清理资源
+        window.addEventListener('beforeunload', () => {
+            // 清除内存检查间隔
+            if (memoryCheckInterval) {
+                clearInterval(memoryCheckInterval);
+                memoryCheckInterval = null;
+            }
+            
+            // 销毁地图实例
+            if (map) {
+                map.destroy();
+                map = null;
+            }
+            
+            // 尝试手动触发垃圾回收
+            forceGC();
+        });
         
         // 启动应用
         main();
