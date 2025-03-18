@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU 地理引擎测试</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            width: 100vw;
+            height: 100vh;
+            background-color: #000;
+        }
+        canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+        .controls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background-color: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: Arial, sans-serif;
+        }
+        .controls button {
+            margin: 5px;
+            padding: 5px 10px;
+            cursor: pointer;
+        }
+        .controls input {
+            margin: 5px;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="webgpu-canvas"></canvas>
+    <div class="controls">
+        <div>
+            <label for="zoom">缩放级别: </label>
+            <input type="range" id="zoom" min="0.5" max="10" step="0.1" value="1">
+            <span id="zoom-value">1.0</span>
+        </div>
+        <div>
+            <label for="auto-rotate">自动旋转: </label>
+            <input type="checkbox" id="auto-rotate">
+        </div>
+        <div>
+            <button id="go-to-china">中国</button>
+            <button id="go-to-us">美国</button>
+            <button id="go-to-europe">欧洲</button>
+        </div>
+    </div>
+    
+    <script type="module">
+        import { AIMap } from '../src/index.ts';
+        
+        async function main() {
+            try {
+                // 创建AIMap实例
+                const map = new AIMap('webgpu-canvas', {
+                    zoom: 1,
+                    center: [0, 0],
+                    enableControl: true
+                });
+                
+                // 设置控制器
+                const zoomSlider = document.getElementById('zoom');
+                const zoomValue = document.getElementById('zoom-value');
+                const autoRotateCheckbox = document.getElementById('auto-rotate');
+                const goToChina = document.getElementById('go-to-china');
+                const goToUS = document.getElementById('go-to-us');
+                const goToEurope = document.getElementById('go-to-europe');
+                
+                // 缩放控制
+                zoomSlider.addEventListener('input', () => {
+                    const zoom = parseFloat(zoomSlider.value);
+                    zoomValue.textContent = zoom.toFixed(1);
+                    map.setZoom(zoom);
+                });
+                
+                // 自动旋转控制
+                autoRotateCheckbox.addEventListener('change', () => {
+                    map.setAutoRotate(autoRotateCheckbox.checked);
+                });
+                
+                // 地点导航
+                goToChina.addEventListener('click', () => {
+                    map.setCenter(110, 35);
+                });
+                
+                goToUS.addEventListener('click', () => {
+                    map.setCenter(-95, 38);
+                });
+                
+                goToEurope.addEventListener('click', () => {
+                    map.setCenter(10, 50);
+                });
+                
+            } catch (error) {
+                console.error("初始化失败:", error);
+                document.body.innerHTML = `
+                    <div style="color: white; padding: 20px;">
+                        <h1>初始化失败</h1>
+                        <p>${error.message}</p>
+                        <p>请确保您的浏览器支持WebGPU，并使用Chrome 113+或Edge 113+版本。</p>
+                    </div>
+                `;
+            }
+        }
+        
+        // 启动应用
+        main();
+    </script>
+</body>
+</html> 
