@@ -8,8 +8,8 @@ export default defineConfig({
       // 指定入口文件
       entry: resolve(__dirname, 'src/index.ts'),
       name: 'ai',
-      fileName: 'aimap-dev',
-      formats: ['umd', 'es'],
+      fileName: (format, entryName) => `aimap-dev.${format}.js`,
+      formats: ['umd', 'es', 'cjs'],
     },
     outDir: 'dist',
     // 启用源码映射，便于调试
