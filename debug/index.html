@@ -51,6 +51,10 @@
             <input type="checkbox" id="auto-rotate">
         </div>
         <div>
+            <label for="show-grid-lines">显示网格线: </label>
+            <input type="checkbox" id="show-grid-lines">
+        </div>
+        <div>
             <button id="go-to-china">中国</button>
             <button id="go-to-us">美国</button>
             <button id="go-to-europe">欧洲</button>
@@ -94,7 +98,8 @@
                 map = new ai.Map('webgpu-canvas', {
                     zoom: 1,
                     center: [0, 0],
-                    enableControl: true
+                    enableControl: true,
+                    showGridLines: true,  // Enable grid lines
                 });
                 
                 // 设置控制器
@@ -104,7 +109,7 @@
                 const goToChina = document.getElementById('go-to-china');
                 const goToUS = document.getElementById('go-to-us');
                 const goToEurope = document.getElementById('go-to-europe');
-                
+                const showGridLinesCheckbox = document.getElementById('show-grid-lines');
                 // 缩放控制
                 zoomSlider.addEventListener('input', () => {
                     const zoom = parseFloat(zoomSlider.value);
@@ -115,6 +120,10 @@
                 // 自动旋转控制
                 autoRotateCheckbox.addEventListener('change', () => {
                     map.setAutoRotate(autoRotateCheckbox.checked);
+                });
+
+                showGridLinesCheckbox.addEventListener('change', () => {
+                    map.toggleGridLines();
                 });
                 
                 // 地点导航
@@ -147,23 +156,23 @@
             }
         }
         
-        // 页面卸载时清理资源
-        window.addEventListener('beforeunload', () => {
-            // 清除内存检查间隔
-            if (memoryCheckInterval) {
-                clearInterval(memoryCheckInterval);
-                memoryCheckInterval = null;
-            }
+        // // 页面卸载时清理资源
+        // window.addEventListener('beforeunload', () => {
+        //     // 清除内存检查间隔
+        //     if (memoryCheckInterval) {
+        //         clearInterval(memoryCheckInterval);
+        //         memoryCheckInterval = null;
+        //     }
             
-            // 销毁地图实例
-            if (map) {
-                map.destroy();
-                map = null;
-            }
+        //     // 销毁地图实例
+        //     if (map) {
+        //         map.destroy();
+        //         map = null;
+        //     }
             
-            // 尝试手动触发垃圾回收
-            forceGC();
-        });
+        //     // 尝试手动触发垃圾回收
+        //     forceGC();
+        // });
         
         // 启动应用
         main();

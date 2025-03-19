@@ -8,13 +8,13 @@ importers:
 
   .:
     dependencies:
-      '@webgpu/types':
-        specifier: ^0.1.56
-        version: 0.1.56
       gl-matrix:
         specifier: ^3.4.3
         version: 3.4.3
     devDependencies:
+      '@webgpu/types':
+        specifier: ^0.1.57
+        version: 0.1.57
       concurrently:
         specifier: ^8.2.2
         version: 8.2.2
@@ -289,8 +289,8 @@ packages:
   '@types/estree@1.0.6':
     resolution: {integrity: sha512-AYnb1nQyY49te+VRAVgmzfcgjYS91mY5P0TKUDCLEM+gNnA+3T6rWITXRLYCpahpqSQbN5cE+gHpnPyXjHWxcw==}
 
-  '@webgpu/types@0.1.56':
-    resolution: {integrity: sha512-JkT4ngqwk4gKAFoWtXCcC1+TGhSStVtauS9z27slOGSFYr+QqjS0CoawiAxP7Gq9xkT4Pw9uouvWPT44HwbUiw==}
+  '@webgpu/types@0.1.57':
+    resolution: {integrity: sha512-w8IuWOmgeb9bA9swqSyG6Z/KdKfCdGPxZ75YJUpsJBF4Q/RT5rnPuStzuxOXihcrSjGO4/maH+M9PQgbBVs69A==}
 
   ansi-regex@5.0.1:
     resolution: {integrity: sha512-quJQXlTSUGL2LH9SUXo8VwsY4soanhgo6LNSm84E1LBcE8s3O0wpdiRzyR9z/ZZJMlMWv37qOOb9pdJlMUEKFQ==}
@@ -621,7 +621,7 @@ snapshots:
 
   '@types/estree@1.0.6': {}
 
-  '@webgpu/types@0.1.56': {}
+  '@webgpu/types@0.1.57': {}
 
   ansi-regex@5.0.1: {}
 

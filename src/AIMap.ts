@@ -31,6 +31,11 @@ export interface AIMapOptions {
      * Canvas的背景颜色
      */
     backgroundColor?: [number, number, number, number];
+
+    /**
+     * 是否显示经纬网格线
+     */
+    showGridLines?: boolean;
 }
 
 /**
@@ -41,7 +46,8 @@ const DEFAULT_OPTIONS: AIMapOptions = {
     center: [0, 0],
     rotation: 0,
     enableControl: true,
-    backgroundColor: [0, 0, 0, 1]
+    backgroundColor: [0, 0, 0, 1],
+    showGridLines: false
 };
 
 /**
@@ -81,7 +87,9 @@ export default class AIMap {
     constructor(canvasId: string | HTMLCanvasElement, options: AIMapOptions = {}) {
         // 合并选项
         this.options = { ...DEFAULT_OPTIONS, ...options };
-        
+        if (!canvasId) {
+            throw new Error('canvasId不能为空');
+        }
         // 获取Canvas元素
         if (typeof canvasId === 'string') {
             const element = document.getElementById(canvasId);
@@ -98,7 +106,7 @@ export default class AIMap {
         // 初始化引擎组件
         this.engine = new Engine();
         this.camera = new Camera();
-        this.renderer = new GlobeRenderer(this.engine, this.camera);
+        this.renderer = new GlobeRenderer(this.engine, this.camera, this.options.showGridLines);
         
         // 绑定事件处理函数
         this.boundHandleResize = this.handleResize.bind(this);
@@ -279,7 +287,8 @@ export default class AIMap {
         if (!this.isDragging) return;
         
         const deltaX = event.clientX - this.lastMouseX;
-        const deltaY = event.clientY - this.lastMouseY;
+        // 修正Y轴方向, 因为Y轴方向是相反的
+        const deltaY = -(event.clientY - this.lastMouseY);
         
         // 旋转地球
         this.rotateGlobeY(-deltaX * this.rotationSpeed);
@@ -470,6 +479,35 @@ export default class AIMap {
      */
     public getCenter(): [number, number] {
         return this.options.center!;
+    }
+    
+    /**
+     * 设置经纬网格线的显示状态
+     * @param visible 是否显示网格线
+     */
+    public setGridLinesVisible(visible: boolean): void {
+        if (this.options.showGridLines !== visible) {
+            this.options.showGridLines = visible;
+            this.renderer.setGridLinesVisible(visible);
+        }
+    }
+    
+    /**
+     * 获取经纬网格线的显示状态
+     * @returns 是否显示网格线
+     */
+    public getGridLinesVisible(): boolean {
+        return this.options.showGridLines ?? false;
+    }
+    
+    /**
+     * 切换经纬网格线的显示状态
+     * @returns 切换后的显示状态
+     */
+    public toggleGridLines(): boolean {
+        const newState = !this.getGridLinesVisible();
+        this.setGridLinesVisible(newState);
+        return newState;
     }
     
     /**

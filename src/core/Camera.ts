@@ -13,7 +13,7 @@ export class Camera {
     private viewProjectionMatrix: mat4 = mat4.create(); // 视图投影矩阵
     
     private aspectRatio: number = 1.0;
-    private fov: number = Math.PI / 4;  // 45度视场角
+    private fov: number = Math.PI / 4;  // 45度视场角 
     private near: number = 0.1;
     private far: number = 1000.0;
     
