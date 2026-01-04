@@ -1,6 +1,9 @@
 import { Engine } from './core/Engine';
 import { Camera } from './core/Camera';
+import { LayerManager } from './core/LayerManager';
 import { GlobeRenderer } from './renderers/GlobeRenderer';
+import { PointLayer, PointData } from './layers/PointLayer';
+import { GeoDataLoader } from './data/GeoDataLoader';
 import { mat4, vec3 } from 'gl-matrix';
 
 /**
@@ -57,9 +60,11 @@ export default class AIMap {
     private engine: Engine;
     private camera: Camera;
     private renderer: GlobeRenderer;
+    private layerManager: LayerManager;
     private canvas: HTMLCanvasElement;
     private options: AIMapOptions;
     private animationFrameId: number | null = null;
+    private lastFrameTime: number = 0;
     
     // 鼠标控制相关属性
     private isDragging: boolean = false;
@@ -78,6 +83,7 @@ export default class AIMap {
     private boundHandleTouchStart: (event: TouchEvent) => void;
     private boundHandleTouchMove: (event: TouchEvent) => void;
     private boundHandleTouchEnd: (event: TouchEvent) => void;
+    private boundHandleKeyDown: (event: KeyboardEvent) => void;
     
     /**
      * 创建AIMap实例
@@ -107,6 +113,7 @@ export default class AIMap {
         this.engine = new Engine();
         this.camera = new Camera();
         this.renderer = new GlobeRenderer(this.engine, this.camera, this.options.showGridLines);
+        this.layerManager = new LayerManager(this.engine, this.camera);
         
         // 绑定事件处理函数
         this.boundHandleResize = this.handleResize.bind(this);
@@ -117,6 +124,7 @@ export default class AIMap {
         this.boundHandleTouchStart = this.handleTouchStart.bind(this);
         this.boundHandleTouchMove = this.handleTouchMove.bind(this);
         this.boundHandleTouchEnd = this.handleTouchEnd.bind(this);
+        this.boundHandleKeyDown = this.handleKeyDown.bind(this);
         
         // 设置事件监听器
         this.setupEventListeners();
@@ -170,6 +178,9 @@ export default class AIMap {
             this.canvas.addEventListener('touchstart', this.boundHandleTouchStart, { passive: false });
             this.canvas.addEventListener('touchmove', this.boundHandleTouchMove, { passive: false });
             this.canvas.addEventListener('touchend', this.boundHandleTouchEnd);
+            
+            // 键盘事件
+            window.addEventListener('keydown', this.boundHandleKeyDown);
         }
     }
     
@@ -238,14 +249,21 @@ export default class AIMap {
             this.animationFrameId = null;
         }
         
-        const renderFrame = () => {
+        const renderFrame = (currentTime: number) => {
+            // 计算帧时间差
+            const deltaTime = currentTime - (this.lastFrameTime || currentTime);
+            this.lastFrameTime = currentTime;
+            
             // 如果启用自动旋转
             if (this.autoRotate) {
                 this.rotateGlobeY(this.autoRotateSpeed);
             }
             
-            // 渲染地球
-            this.renderer.render();
+            // 更新图层
+            this.layerManager.update(deltaTime);
+            
+            // 渲染地球和图层
+            this.renderScene();
             
             // 继续渲染循环
             this.animationFrameId = requestAnimationFrame(renderFrame);
@@ -253,6 +271,17 @@ export default class AIMap {
         
         // 启动渲染循环
         this.animationFrameId = requestAnimationFrame(renderFrame);
+    }
+    
+    /**
+     * 渲染场景（地球和所有图层）
+     */
+    private renderScene(): void {
+        // 渲染地球（包含内置的渲染通道管理）
+        this.renderer.render();
+        
+        // TODO: 将图层渲染集成到renderer中，或者创建单独的渲染通道
+        // 目前先使用简单的方法
     }
     
     /**
@@ -366,6 +395,79 @@ export default class AIMap {
     private handleTouchEnd(event: TouchEvent): void {
         console.log('TouchEvent', event);
         this.isDragging = false;
+    }
+    
+    /**
+     * 处理键盘事件
+     */
+    private handleKeyDown(event: KeyboardEvent): void {
+        if (!this.options.enableControl) return;
+        
+        const rotationStep = 0.1;
+        const zoomStep = 0.1;
+        
+        switch (event.key) {
+            case 'ArrowLeft':
+            case 'a':
+            case 'A':
+                this.rotateGlobeY(-rotationStep);
+                event.preventDefault();
+                break;
+                
+            case 'ArrowRight':
+            case 'd':
+            case 'D':
+                this.rotateGlobeY(rotationStep);
+                event.preventDefault();
+                break;
+                
+            case 'ArrowUp':
+            case 'w':
+            case 'W':
+                this.rotateGlobeX(rotationStep);
+                event.preventDefault();
+                break;
+                
+            case 'ArrowDown':
+            case 's':
+            case 'S':
+                this.rotateGlobeX(-rotationStep);
+                event.preventDefault();
+                break;
+                
+            case '+':
+            case '=':
+                this.setZoom(this.options.zoom! * (1 + zoomStep));
+                event.preventDefault();
+                break;
+                
+            case '-':
+            case '_':
+                this.setZoom(this.options.zoom! * (1 - zoomStep));
+                event.preventDefault();
+                break;
+                
+            case ' ':
+                this.setAutoRotate(!this.autoRotate);
+                event.preventDefault();
+                break;
+                
+            case 'r':
+            case 'R':
+                // 重置视角
+                this.setZoom(1);
+                this.setCenter(0, 0);
+                this.setAutoRotate(false);
+                event.preventDefault();
+                break;
+                
+            case 'g':
+            case 'G':
+                // 切换网格线
+                this.toggleGridLines();
+                event.preventDefault();
+                break;
+        }
     }
     
     /**
@@ -511,11 +613,106 @@ export default class AIMap {
     }
     
     /**
+     * 添加点图层
+     */
+    public async addPointLayer(id: string, name: string, points: PointData[]): Promise<boolean> {
+        const pointLayer = new PointLayer(id, name, this.engine, this.camera);
+        pointLayer.addPoints(points);
+        return await this.layerManager.addLayer(pointLayer);
+    }
+    
+    /**
+     * 移除图层
+     */
+    public removeLayer(id: string): boolean {
+        return this.layerManager.removeLayer(id);
+    }
+    
+    /**
+     * 设置图层可见性
+     */
+    public setLayerVisible(id: string, visible: boolean): boolean {
+        return this.layerManager.setLayerVisible(id, visible);
+    }
+    
+    /**
+     * 设置图层透明度
+     */
+    public setLayerOpacity(id: string, opacity: number): boolean {
+        return this.layerManager.setLayerOpacity(id, opacity);
+    }
+    
+    /**
+     * 获取图层管理器
+     */
+    public getLayerManager(): LayerManager {
+        return this.layerManager;
+    }
+    
+    /**
+     * 设置光照方向
+     */
+    public setLightDirection(x: number, y: number, z: number): void {
+        this.renderer.setLightDirection(x, y, z);
+    }
+    
+    /**
+     * 加载示例城市数据
+     */
+    public async loadSampleCityData(): Promise<boolean> {
+        const cityData = GeoDataLoader.createSampleCityData();
+        const pointData: PointData[] = cityData.map(city => ({
+            longitude: city.longitude,
+            latitude: city.latitude,
+            altitude: city.altitude,
+            color: [1.0, 0.8, 0.0, 1.0], // 金色
+            size: Math.log(city.properties?.population || 1000000) * 2, // 根据人口调整大小
+            label: city.properties?.name,
+            data: city.properties
+        }));
+        
+        return await this.addPointLayer('cities', '世界城市', pointData);
+    }
+    
+    /**
+     * 从GeoJSON URL加载数据
+     */
+    public async loadGeoJSONData(url: string, layerId: string, layerName: string): Promise<boolean> {
+        try {
+            const geoJSON = await GeoDataLoader.loadGeoJSON(url);
+            if (!geoJSON) {
+                console.error('Failed to load GeoJSON data');
+                return false;
+            }
+            
+            const pointData = GeoDataLoader.parsePointsFromGeoJSON(geoJSON);
+            const points: PointData[] = pointData.map(point => ({
+                longitude: point.longitude,
+                latitude: point.latitude,
+                altitude: point.altitude,
+                color: [0.0, 1.0, 0.0, 1.0], // 绿色
+                size: 5.0,
+                data: point.properties
+            }));
+            
+            return await this.addPointLayer(layerId, layerName, points);
+        } catch (error) {
+            console.error('Error loading GeoJSON data:', error);
+            return false;
+        }
+    }
+    
+    /**
      * 销毁AIMap实例
      */
     public destroy(): void {
         // 停止渲染循环
         this.stop();
+        
+        // 释放图层管理器
+        if (this.layerManager) {
+            this.layerManager.destroy();
+        }
         
         // 释放WebGPU资源
         if (this.renderer) {
@@ -538,6 +735,7 @@ export default class AIMap {
             this.canvas.removeEventListener('touchstart', this.boundHandleTouchStart);
             this.canvas.removeEventListener('touchmove', this.boundHandleTouchMove);
             this.canvas.removeEventListener('touchend', this.boundHandleTouchEnd);
+            window.removeEventListener('keydown', this.boundHandleKeyDown);
         }
     }
 } 

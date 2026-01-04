@@ -36,6 +36,18 @@
         .controls input {
             margin: 5px;
         }
+        .keyboard-help {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+            max-width: 300px;
+        }
     </style>
 </head>
 <body>
@@ -59,6 +71,26 @@
             <button id="go-to-us">美国</button>
             <button id="go-to-europe">欧洲</button>
         </div>
+        <div>
+            <button id="load-cities">加载城市数据</button>
+            <button id="toggle-cities">切换城市显示</button>
+        </div>
+        <div>
+            <label for="light-x">光照X: </label>
+            <input type="range" id="light-x" min="-2" max="2" step="0.1" value="1">
+            <label for="light-y">光照Y: </label>
+            <input type="range" id="light-y" min="-2" max="2" step="0.1" value="1">
+            <label for="light-z">光照Z: </label>
+            <input type="range" id="light-z" min="-2" max="2" step="0.1" value="1">
+        </div>
+    </div>
+    <div class="keyboard-help">
+        <h4>键盘控制:</h4>
+        <p><strong>WASD/方向键</strong>: 旋转地球</p>
+        <p><strong>+/-</strong>: 缩放</p>
+        <p><strong>空格</strong>: 切换自动旋转</p>
+        <p><strong>R</strong>: 重置视角</p>
+        <p><strong>G</strong>: 切换网格线</p>
     </div>
     <!-- 或者使用本地打包后的文件 -->
     <script src="../dist/aimap-dev.umd.js"></script>
@@ -110,6 +142,11 @@
                 const goToUS = document.getElementById('go-to-us');
                 const goToEurope = document.getElementById('go-to-europe');
                 const showGridLinesCheckbox = document.getElementById('show-grid-lines');
+                const loadCitiesButton = document.getElementById('load-cities');
+                const toggleCitiesButton = document.getElementById('toggle-cities');
+                const lightXSlider = document.getElementById('light-x');
+                const lightYSlider = document.getElementById('light-y');
+                const lightZSlider = document.getElementById('light-z');
                 // 缩放控制
                 zoomSlider.addEventListener('input', () => {
                     const zoom = parseFloat(zoomSlider.value);
@@ -138,6 +175,39 @@
                 goToEurope.addEventListener('click', () => {
                     map.setCenter(10, 50);
                 });
+                
+                // 城市数据控制
+                loadCitiesButton.addEventListener('click', async () => {
+                    const success = await map.loadSampleCityData();
+                    if (success) {
+                        console.log('城市数据加载成功');
+                        loadCitiesButton.textContent = '城市数据已加载';
+                        loadCitiesButton.disabled = true;
+                    } else {
+                        console.error('城市数据加载失败');
+                    }
+                });
+                
+                toggleCitiesButton.addEventListener('click', () => {
+                    const visible = map.getLayerManager().getLayer('cities')?.isVisible();
+                    if (visible !== undefined) {
+                        map.setLayerVisible('cities', !visible);
+                        toggleCitiesButton.textContent = visible ? '显示城市' : '隐藏城市';
+                    }
+                });
+                
+                // 光照控制
+                const updateLighting = () => {
+                    const x = parseFloat(lightXSlider.value);
+                    const y = parseFloat(lightYSlider.value);
+                    const z = parseFloat(lightZSlider.value);
+                    map.setLightDirection(x, y, z);
+                    console.log(`Light direction: ${x}, ${y}, ${z}`);
+                };
+                
+                lightXSlider.addEventListener('input', updateLighting);
+                lightYSlider.addEventListener('input', updateLighting);
+                lightZSlider.addEventListener('input', updateLighting);
                 
                 // 启动内存监控（仅开发环境）
                 memoryCheckInterval = setInterval(() => {

@@ -1,6 +1,8 @@
 import { Engine } from '../core/Engine';
 import { Camera } from '../core/Camera';
-import { mat4 } from 'gl-matrix';
+import { TextureManager } from '../core/TextureManager';
+import { GlobeShaders } from '../shaders/GlobeShaders';
+import { mat4, vec3 } from 'gl-matrix';
 
 /**
  * 球体渲染器
@@ -8,24 +10,38 @@ import { mat4 } from 'gl-matrix';
 export class GlobeRenderer {
     private engine: Engine;
     private camera: Camera;
+    private textureManager: TextureManager | null = null;
+    
+    // 渲染管线
     private pipeline: GPURenderPipeline | null = null;
+    private gridPipeline: GPURenderPipeline | null = null;
+    
+    // 几何体缓冲区
     private vertexBuffer: GPUBuffer | null = null;
     private indexBuffer: GPUBuffer | null = null;
+    private gridVertexBuffer: GPUBuffer | null = null;
+    private gridIndexBuffer: GPUBuffer | null = null;
+    private indexCount: number = 0;
+    private gridIndexCount: number = 0;
+    
+    // 统一变量
     private uniformBuffer: GPUBuffer | null = null;
     private uniformBindGroup: GPUBindGroup | null = null;
-    private indexCount: number = 0;
     
-    // 缓存深度纹理
+    // 纹理资源
+    private earthTexture: GPUTexture | null = null;
+    private normalTexture: GPUTexture | null = null;
+    private earthSampler: GPUSampler | null = null;
+    private normalSampler: GPUSampler | null = null;
+    
+    // 深度纹理
     private depthTexture: GPUTexture | null = null;
     private canvasWidth: number = 0;
     private canvasHeight: number = 0;
     
-    // 网格线相关属性
+    // 渲染设置
     private showGridLines: boolean = false;
-    private gridPipeline: GPURenderPipeline | null = null;
-    private gridVertexBuffer: GPUBuffer | null = null;
-    private gridIndexBuffer: GPUBuffer | null = null;
-    private gridIndexCount: number = 0;
+    private lightDirection: vec3 = vec3.fromValues(1, 1, 1);
     
     constructor(engine: Engine, camera: Camera, showGridLines: boolean = false) {
         this.engine = engine;
@@ -221,96 +237,125 @@ export class GlobeRenderer {
             return false;
         }
         
-        // 创建球体几何体
-        this.createSphereGeometry(device);
+        // 初始化纹理管理器
+        this.textureManager = new TextureManager(device);
+        
+        // 创建球体几何体（包含法线和UV坐标）
+        this.createEnhancedSphereGeometry(device);
         
         // 如果启用网格线，创建网格线几何体
         if (this.showGridLines) {
             this.createGridGeometry(device);
         }
         
-        // 创建统一缓冲区
+        // 创建纹理资源
+        await this.createTextures();
+        
+        // 创建统一缓冲区 (扩展以包含更多数据)
         this.uniformBuffer = device.createBuffer({
-            label: "Uniform Buffer",
-            size: 64 * 3, // 3个mat4矩阵
+            label: "Enhanced Uniform Buffer",
+            size: 64 * 3 + 16 + 16 + 16, // 3个mat4 + lightDirection + time + cameraPosition + padding
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         
-        // 创建着色器
+        // 创建着色器模块
         const shaderModule = device.createShaderModule({
-            label: "Globe shaders",
-            code: `
-                struct Uniforms {
-                    modelMatrix: mat4x4<f32>,
-                    viewMatrix: mat4x4<f32>,
-                    projectionMatrix: mat4x4<f32>,
-                };
-                
-                @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-                
-                struct VertexOutput {
-                    @builtin(position) position: vec4<f32>,
-                };
-                
-                @vertex
-                fn vertexMain(@location(0) position: vec3<f32>) -> VertexOutput {
-                    var output: VertexOutput;
-                    output.position = uniforms.projectionMatrix * uniforms.viewMatrix * uniforms.modelMatrix * vec4<f32>(position, 1.0);
-                    return output;
-                }
-                
-                @fragment
-                fn fragmentMain() -> @location(0) vec4<f32> {
-                    // 使用浅灰色，以便网格线更明显
-                    return vec4<f32>(0.5, 0.5, 0.5, 1.0);
-                }
-            `
+            label: "Enhanced Globe shaders",
+            code: GlobeShaders.getVertexShader() + GlobeShaders.getFragmentShader()
         });
         
         // 创建绑定组布局
         const bindGroupLayout = device.createBindGroupLayout({
-            label: "Globe Bind Group Layout",
-            entries: [{
-                binding: 0,
-                visibility: GPUShaderStage.VERTEX,
-                buffer: {
-                    type: "uniform"
+            label: "Enhanced Globe Bind Group Layout",
+            entries: [
+                {
+                    binding: 0,
+                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                    buffer: { type: "uniform" }
+                },
+                {
+                    binding: 1,
+                    visibility: GPUShaderStage.FRAGMENT,
+                    texture: { sampleType: "float" }
+                },
+                {
+                    binding: 2,
+                    visibility: GPUShaderStage.FRAGMENT,
+                    sampler: {}
+                },
+                {
+                    binding: 3,
+                    visibility: GPUShaderStage.FRAGMENT,
+                    texture: { sampleType: "float" }
+                },
+                {
+                    binding: 4,
+                    visibility: GPUShaderStage.FRAGMENT,
+                    sampler: {}
                 }
-            }]
+            ]
         });
         
         // 创建管线布局
         const pipelineLayout = device.createPipelineLayout({
-            label: "Globe Pipeline Layout",
+            label: "Enhanced Globe Pipeline Layout",
             bindGroupLayouts: [bindGroupLayout]
         });
         
         // 创建绑定组
         this.uniformBindGroup = device.createBindGroup({
-            label: "Globe Uniform Bind Group",
+            label: "Enhanced Globe Uniform Bind Group",
             layout: bindGroupLayout,
-            entries: [{
-                binding: 0,
-                resource: {
-                    buffer: this.uniformBuffer
+            entries: [
+                {
+                    binding: 0,
+                    resource: { buffer: this.uniformBuffer }
+                },
+                {
+                    binding: 1,
+                    resource: this.earthTexture!.createView()
+                },
+                {
+                    binding: 2,
+                    resource: this.earthSampler!
+                },
+                {
+                    binding: 3,
+                    resource: this.normalTexture!.createView()
+                },
+                {
+                    binding: 4,
+                    resource: this.normalSampler!
                 }
-            }]
+            ]
         });
         
         // 创建渲染管线
         this.pipeline = device.createRenderPipeline({
-            label: "Globe pipeline",
+            label: "Enhanced Globe pipeline",
             layout: pipelineLayout,
             vertex: {
                 module: shaderModule,
                 entryPoint: "vertexMain",
                 buffers: [{
-                    arrayStride: 12, // 3 * float32
-                    attributes: [{
-                        shaderLocation: 0,
-                        offset: 0,
-                        format: "float32x3" // 3D positions
-                    }]
+                    arrayStride: 32, // 3 * float32 (position) + 3 * float32 (normal) + 2 * float32 (uv)
+                    attributes: [
+                        {
+                            shaderLocation: 0, // position
+                            offset: 0,
+                            format: "float32x3"
+                        },
+                        {
+                            shaderLocation: 1, // normal
+                            offset: 12,
+                            format: "float32x3"
+                        },
+                        {
+                            shaderLocation: 2, // uv
+                            offset: 24,
+                            format: "float32x2"
+                        }
+                    ]
                 }]
             },
             fragment: {
@@ -346,11 +391,14 @@ export class GlobeRenderer {
 
         // 如果启用网格线，创建网格线渲染管线
         if (this.showGridLines) {
-            this.createGridPipeline(device, context);
+            this.createEnhancedGridPipeline(device, context);
         }
         
         // 初始化深度纹理
         this.updateDepthTexture(device, context);
+        
+        // 标准化光照方向
+        vec3.normalize(this.lightDirection, this.lightDirection);
         
         return true;
     }
@@ -388,25 +436,67 @@ export class GlobeRenderer {
     }
     
     /**
-     * 创建球体几何体
+     * 创建纹理资源
      */
-    private createSphereGeometry(device: GPUDevice, radius: number = 1.0, segments: number = 32): void {
+    private async createTextures(): Promise<void> {
+        if (!this.textureManager) return;
+        
+        // 创建地球纹理
+        this.earthTexture = this.textureManager.createDefaultEarthTexture();
+        
+        // 创建法线贴图
+        this.normalTexture = this.textureManager.createDefaultNormalTexture();
+        
+        // 创建采样器
+        this.earthSampler = this.textureManager.createSampler({
+            magFilter: 'linear',
+            minFilter: 'linear',
+            addressModeU: 'repeat',
+            addressModeV: 'clamp-to-edge'
+        });
+        
+        this.normalSampler = this.textureManager.createSampler({
+            magFilter: 'linear',
+            minFilter: 'linear',
+            addressModeU: 'repeat',
+            addressModeV: 'clamp-to-edge'
+        });
+    }
+    
+    /**
+     * 创建增强的球体几何体（包含法线和UV坐标）
+     */
+    private createEnhancedSphereGeometry(device: GPUDevice, radius: number = 1.0, segments: number = 64): void {
         const vertices: number[] = [];
         const indices: number[] = [];
         
-        // 生成顶点
+        // 生成顶点（位置 + 法线 + UV）
         for (let y = 0; y <= segments; y++) {
             const phi = (y / segments) * Math.PI;
+            const sinPhi = Math.sin(phi);
+            const cosPhi = Math.cos(phi);
             
             for (let x = 0; x <= segments; x++) {
                 const theta = (x / segments) * Math.PI * 2;
+                const sinTheta = Math.sin(theta);
+                const cosTheta = Math.cos(theta);
                 
-                // 球面坐标到笛卡尔坐标的转换
-                const px = radius * Math.sin(phi) * Math.cos(theta);
-                const py = radius * Math.cos(phi);
-                const pz = radius * Math.sin(phi) * Math.sin(theta);
+                // 位置
+                const px = radius * sinPhi * cosTheta;
+                const py = radius * cosPhi;
+                const pz = radius * sinPhi * sinTheta;
                 
-                vertices.push(px, py, pz);
+                // 法线（对于球体，法线就是归一化的位置向量）
+                const nx = sinPhi * cosTheta;
+                const ny = cosPhi;
+                const nz = sinPhi * sinTheta;
+                
+                // UV坐标
+                const u = x / segments;
+                const v = y / segments;
+                
+                // 添加顶点数据：位置(3) + 法线(3) + UV(2)
+                vertices.push(px, py, pz, nx, ny, nz, u, v);
             }
         }
         
@@ -418,22 +508,26 @@ export class GlobeRenderer {
                 const i3 = i1 + (segments + 1);
                 const i4 = i3 + 1;
                 
-                // 一个矩形分成两个三角形
-                indices.push(i1, i3, i2);
-                indices.push(i2, i3, i4);
+                // 避免极点处的退化三角形
+                if (y !== 0) {
+                    indices.push(i1, i3, i2);
+                }
+                if (y !== segments - 1) {
+                    indices.push(i2, i3, i4);
+                }
             }
         }
         
         // 创建顶点缓冲区
         this.vertexBuffer = device.createBuffer({
-            label: "Sphere vertices",
+            label: "Enhanced Sphere vertices",
             size: vertices.length * 4, // float32 = 4 bytes
             usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
         });
         
         // 创建索引缓冲区
         this.indexBuffer = device.createBuffer({
-            label: "Sphere indices",
+            label: "Enhanced Sphere indices",
             size: indices.length * 4, // uint32 = 4 bytes
             usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
         });
@@ -444,6 +538,7 @@ export class GlobeRenderer {
         
         this.indexCount = indices.length;
     }
+    
     
     /**
      * 创建网格线几何体
@@ -491,8 +586,6 @@ export class GlobeRenderer {
             const cosPhi = Math.cos(phi);
             const circleRadius = radius * sinPhi;
             
-            const startIndex = indexCounter;
-            
             // 创建圆形线
             for (let j = 0; j <= 36; j++) {
                 const angle = (j / 36) * Math.PI * 2;
@@ -535,6 +628,79 @@ export class GlobeRenderer {
     }
     
     /**
+     * 创建增强的网格线渲染管线
+     */
+    private createEnhancedGridPipeline(device: GPUDevice, context: GPUCanvasContext): void {
+        // 创建网格线着色器模块
+        const gridShaderModule = device.createShaderModule({
+            label: "Enhanced Grid shaders",
+            code: GlobeShaders.getGridVertexShader() + GlobeShaders.getGridFragmentShader()
+        });
+        
+        // 获取绑定组布局（复用主渲染管线的布局）
+        const bindGroupLayout = device.createBindGroupLayout({
+            label: "Grid Bind Group Layout",
+            entries: [{
+                binding: 0,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                buffer: { type: "uniform" }
+            }]
+        });
+        
+        // 创建管线布局
+        const pipelineLayout = device.createPipelineLayout({
+            label: "Enhanced Grid Pipeline Layout",
+            bindGroupLayouts: [bindGroupLayout]
+        });
+        
+        // 创建网格线渲染管线
+        this.gridPipeline = device.createRenderPipeline({
+            label: "Enhanced Grid pipeline",
+            layout: pipelineLayout,
+            vertex: {
+                module: gridShaderModule,
+                entryPoint: "vertexMain",
+                buffers: [{
+                    arrayStride: 12, // 3 * float32 (position only)
+                    attributes: [{
+                        shaderLocation: 0,
+                        offset: 0,
+                        format: "float32x3"
+                    }]
+                }]
+            },
+            fragment: {
+                module: gridShaderModule,
+                entryPoint: "fragmentMain",
+                targets: [{
+                    format: context.getCurrentTexture().format,
+                    blend: {
+                        color: {
+                            srcFactor: "src-alpha",
+                            dstFactor: "one-minus-src-alpha",
+                            operation: "add"
+                        },
+                        alpha: {
+                            srcFactor: "one",
+                            dstFactor: "one-minus-src-alpha",
+                            operation: "add"
+                        }
+                    }
+                }]
+            },
+            primitive: {
+                topology: "line-list",
+                cullMode: "none"
+            },
+            depthStencil: {
+                depthWriteEnabled: false, // 网格线不写入深度
+                depthCompare: "less-equal",
+                format: "depth24plus"
+            }
+        });
+    }
+    
+    /**
      * 更新统一变量
      */
     private updateUniforms(device: GPUDevice): void {
@@ -547,12 +713,30 @@ export class GlobeRenderer {
         // 获取相机矩阵
         const viewMatrix = this.camera.getViewMatrix();
         const projectionMatrix = this.camera.getProjectionMatrix();
+        const cameraPosition = this.camera.getPosition();
         
-        // 创建一个包含所有矩阵数据的数组
-        const uniformData = new Float32Array(16 * 3);
+        // 计算时间（用于动画效果）
+        const time = Date.now() * 0.001;
+        
+        // 创建包含所有数据的数组
+        const uniformData = new Float32Array(48 + 4 + 4 + 4); // 3*16 + 4 + 4 + 4
+        
+        // 矩阵数据
         uniformData.set(modelMatrix as Float32Array, 0);
         uniformData.set(viewMatrix as Float32Array, 16);
         uniformData.set(projectionMatrix as Float32Array, 32);
+        
+        // 光照方向
+        uniformData[48] = this.lightDirection[0];
+        uniformData[49] = this.lightDirection[1];
+        uniformData[50] = this.lightDirection[2];
+        uniformData[51] = time; // 时间
+        
+        // 相机位置
+        uniformData[52] = cameraPosition[0];
+        uniformData[53] = cameraPosition[1];
+        uniformData[54] = cameraPosition[2];
+        uniformData[55] = 0.0; // padding
         
         // 写入到统一缓冲区
         device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
@@ -642,6 +826,14 @@ export class GlobeRenderer {
     }
     
     /**
+     * 设置光照方向
+     */
+    public setLightDirection(x: number, y: number, z: number): void {
+        vec3.set(this.lightDirection, x, y, z);
+        vec3.normalize(this.lightDirection, this.lightDirection);
+    }
+    
+    /**
      * 释放渲染器资源
      */
     public destroy(): void {
@@ -681,9 +873,20 @@ export class GlobeRenderer {
             this.depthTexture = null;
         }
         
+        // 释放纹理管理器资源
+        if (this.textureManager) {
+            this.textureManager.destroy();
+            this.textureManager = null;
+        }
+        
+        // 清空引用
         this.pipeline = null;
         this.gridPipeline = null;
         this.uniformBindGroup = null;
+        this.earthTexture = null;
+        this.normalTexture = null;
+        this.earthSampler = null;
+        this.normalSampler = null;
         this.indexCount = 0;
         this.gridIndexCount = 0;
     }
