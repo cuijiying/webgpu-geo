@@ -29,10 +29,15 @@
         <div>拖拽：平移　滚轮：缩放</div>
         <div>center: <b id="center">-</b></div>
         <div>zoom:   <b id="zoom">-</b></div>
+        <div>proj:   <b id="proj">-</b></div>
+        <div style="margin-top:6px;pointer-events:auto">
+            <button id="btn-2d" style="cursor:pointer">2D 平面</button>
+            <button id="btn-3d" style="cursor:pointer">3D 球体</button>
+        </div>
     </div>
     <div class="attribution">© OpenStreetMap contributors</div>
 
-    <script src="../dist/aimap-dev.umd.js"></script>
+    <script>document.write('<script src="../dist/aimap-dev.umd.js?v=' + Date.now() + '"><\/script>');</script>
     <script>
         (async function () {
             const map = new ai.Map({
@@ -41,6 +46,7 @@
                 zoom: 4,
                 minZoom: 0,
                 maxZoom: 19,
+                projection: 'mercator',
                 tileSource: {
                     url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                     subdomains: ['a', 'b', 'c'],
@@ -51,13 +57,18 @@
 
             const $c = document.getElementById('center');
             const $z = document.getElementById('zoom');
+            const $p = document.getElementById('proj');
             function updateHud() {
                 const c = map.getCenter();
                 $c.textContent = c.lng.toFixed(4) + ', ' + c.lat.toFixed(4);
                 $z.textContent = map.getZoom().toFixed(2);
+                $p.textContent = map.getProjection();
             }
             map.camera.onChange(updateHud);
             updateHud();
+
+            document.getElementById('btn-2d').onclick = () => map.setProjection('mercator');
+            document.getElementById('btn-3d').onclick = () => map.setProjection('globe');
 
             window.map = map;
         })().catch(function (err) {

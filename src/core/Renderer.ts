@@ -96,11 +96,13 @@ export class Renderer {
         const device = this._engine.device;
         const ctx = this._engine.context;
         const encoder = device.createCommandEncoder({ label: 'frame-encoder' });
-        const view = ctx.getCurrentTexture().createView();
+        const swapView = ctx.getCurrentTexture().createView();
+        const msaaView = this._engine.msaaTexture.createView();
         const pass = encoder.beginRenderPass({
             label: 'main-pass',
             colorAttachments: [{
-                view,
+                view: msaaView,
+                resolveTarget: swapView,
                 clearValue: this._engine.clearColor,
                 loadOp: 'clear',
                 storeOp: 'store',

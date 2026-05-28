@@ -72,9 +72,7 @@ export class MapInteraction {
         const dy = y - this._lastY;
         this._lastX = x;
         this._lastY = y;
-        const upp = this._camera.worldUnitsPerPixel() * this._dpr;
-        const c = this._camera.getCenterWorld();
-        this._camera.setCenterWorld(c.x - dx * upp, c.y - dy * upp);
+        this._camera.panByPixels(dx, dy, this._dpr);
     }
     private _handleUp(): void {
         if (!this._dragging) return;
@@ -83,8 +81,14 @@ export class MapInteraction {
     }
     private _handleWheel(e: WheelEvent): void {
         e.preventDefault();
-        // 标准化滚轮强度（不同设备/系统差异较大）
-        const delta = -Math.sign(e.deltaY) * 0.4;
+        // 将 deltaY 按 deltaMode 归一化为“行”，再转为 zoom 增量
+        // 鼠标滚轮一格 ≈ 100px；trackpad 连续很小
+        let lines = e.deltaY;
+        if (e.deltaMode === 1) lines *= 16;          // LINE
+        else if (e.deltaMode === 2) lines *= 400;    // PAGE
+        // 限制单次跨度，避免某些 trackpad 一次上报几百像素导致狂变
+        const clamped = Math.max(-200, Math.min(200, lines));
+        const delta = -clamped / 200; // 200px ≈ 1 zoom 级
         const rect = this._canvas.getBoundingClientRect();
         const px = e.clientX - rect.left;
         const py = e.clientY - rect.top;

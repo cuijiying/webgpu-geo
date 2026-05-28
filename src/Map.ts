@@ -1,6 +1,6 @@
 import { Engine, type EngineOptions } from './core/Engine';
 import { Renderer } from './core/Renderer';
-import { Camera } from './camera/Camera';
+import { Camera, type ProjectionMode } from './camera/Camera';
 import { Layer } from './layers/Layer';
 import { RasterTileLayer } from './layers/RasterTileLayer';
 import { TileSource } from './tile/TileSource';
@@ -24,6 +24,8 @@ export interface MapOptions {
     tileSource?: TileSource | { url: string; subdomains?: string[]; attribution?: string };
     /** 是否启用鼠标/触摸交互，默认 true */
     interactive?: boolean;
+    /** 初始投影模式：'mercator' (默认) | 'globe' (3D 球体) */
+    projection?: ProjectionMode;
     /** 引擎选项 */
     engine?: EngineOptions;
 }
@@ -58,6 +60,7 @@ export class Map {
         }
         if (opts.zoom !== undefined) this.camera.setZoom(opts.zoom);
         if (opts.center) this.camera.setCenter(opts.center);
+        if (opts.projection) this.camera.setProjection(opts.projection);
         this.renderer = new Renderer(this.engine, this.camera);
 
         // 相机变化 → 请求重绘
@@ -107,6 +110,10 @@ export class Map {
     getCenter(): LngLat { return this.camera.getCenter(); }
     setZoom(z: number): this { this.camera.setZoom(z); return this; }
     getZoom(): number { return this.camera.getZoom(); }
+
+    /** 切换投影模式（'mercator' | 'globe'），会触发重绘 */
+    setProjection(mode: ProjectionMode): this { this.camera.setProjection(mode); return this; }
+    getProjection(): ProjectionMode { return this.camera.getProjection(); }
 
     /** 销毁地图，释放所有资源 */
     destroy(): void {

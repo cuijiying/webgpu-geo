@@ -24,6 +24,9 @@ export interface EngineOptions {
  * 其它子系统（Renderer / Layer）都依赖 Engine 暴露的资源。
  */
 export class Engine {
+    /** 抗锯齿采样数（固定 4× MSAA） */
+    static readonly SAMPLE_COUNT = 4;
+
     private _canvas!: HTMLCanvasElement;
     private _device!: GPUDevice;
     private _context!: GPUCanvasContext;
@@ -32,6 +35,7 @@ export class Engine {
     private _clearColor: GPUColor;
     private _powerPreference: GPUPowerPreference;
     private _depthTexture: GPUTexture | null = null;
+    private _msaaTexture: GPUTexture | null = null;
 
     constructor(opts: EngineOptions = {}) {
         this._dpr = opts.devicePixelRatio ?? (window.devicePixelRatio || 1);
@@ -86,10 +90,20 @@ export class Engine {
         if (this._canvas.width === w && this._canvas.height === h) return false;
         this._canvas.width = w;
         this._canvas.height = h;
-        // 重建 depth texture
+        // 重建多采样颜色纹理（用于 MSAA，最终 resolve 到 swapchain）
+        this._msaaTexture?.destroy();
+        this._msaaTexture = this._device.createTexture({
+            size: { width: w, height: h },
+            sampleCount: Engine.SAMPLE_COUNT,
+            format: this._format,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            label: 'engine-msaa-texture',
+        });
+        // 重建 depth texture（必须与颜色采样数一致）
         this._depthTexture?.destroy();
         this._depthTexture = this._device.createTexture({
             size: { width: w, height: h },
+            sampleCount: Engine.SAMPLE_COUNT,
             format: 'depth24plus',
             usage: GPUTextureUsage.RENDER_ATTACHMENT,
             label: 'engine-depth-texture',
@@ -101,6 +115,8 @@ export class Engine {
     destroy(): void {
         this._depthTexture?.destroy();
         this._depthTexture = null;
+        this._msaaTexture?.destroy();
+        this._msaaTexture = null;
         // GPUDevice 没有公开 destroy，丢弃引用即可（未来 API 会提供 device.destroy()）
         (this._device as unknown as { destroy?: () => void }).destroy?.();
     }
@@ -116,6 +132,11 @@ export class Engine {
         if (!this._depthTexture) throw new Error('Engine 未初始化');
         return this._depthTexture;
     }
+    get msaaTexture(): GPUTexture {
+        if (!this._msaaTexture) throw new Error('Engine 未初始化');
+        return this._msaaTexture;
+    }
+    get sampleCount(): number { return Engine.SAMPLE_COUNT; }
     get width(): number { return this._canvas.width; }
     get height(): number { return this._canvas.height; }
 }

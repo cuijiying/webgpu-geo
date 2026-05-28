@@ -2,7 +2,7 @@
 export { Map, type MapOptions } from './Map';
 export { Engine, type EngineOptions } from './core/Engine';
 export { Renderer, type FrameContext } from './core/Renderer';
-export { Camera } from './camera/Camera';
+export { Camera, type ProjectionMode } from './camera/Camera';
 export { Layer } from './layers/Layer';
 export { RasterTileLayer, type RasterTileLayerOptions } from './layers/RasterTileLayer';
 export { TileSource, type TileSourceOptions } from './tile/TileSource';

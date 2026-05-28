@@ -3,7 +3,7 @@ import type { Engine } from '../core/Engine';
 import type { FrameContext } from '../core/Renderer';
 import { TileSource } from '../tile/TileSource';
 import { TileCache } from '../tile/TileCache';
-import { TileLoader } from '../tile/TileLoader';
+import { TileLoader, TileLoadPriority } from '../tile/TileLoader';
 import { TilePyramid } from '../tile/TilePyramid';
 import { Tile, TileState } from '../tile/Tile';
 import { tileKey, type TileCoord } from '../geo/types';
@@ -39,11 +39,36 @@ export interface RasterTileLayerOptions {
     parentPrefetchLevels?: number;
 }
 
-/** 单位方块顶点（两个三角形组成 quad） */
-const QUAD_VERTICES = new Float32Array([
-    0, 0,  1, 0,  0, 1,
-    0, 1,  1, 0,  1, 1,
-]);
+/** 镶嵌级别：N 表示一个瓦片被划分为 N×N 个小单元（(N+1)² 个顶点）
+ * mercator 模式下其实N=1就够了；globe 模式需要足够细才能贴合球面。 */
+const MESH_TESS = 32;
+
+/** 生成 N×N 镶嵌的单位方块顶点 + 索引 */
+function buildTessellatedQuad(n: number): { vertices: Float32Array; indices: Uint16Array } {
+    const verts = new Float32Array((n + 1) * (n + 1) * 2);
+    let vi = 0;
+    for (let j = 0; j <= n; j++) {
+        for (let i = 0; i <= n; i++) {
+            verts[vi++] = i / n;
+            verts[vi++] = j / n;
+        }
+    }
+    const idx = new Uint16Array(n * n * 6);
+    let ii = 0;
+    for (let j = 0; j < n; j++) {
+        for (let i = 0; i < n; i++) {
+            const a = j * (n + 1) + i;
+            const b = a + 1;
+            const c = a + (n + 1);
+            const d = c + 1;
+            idx[ii++] = a; idx[ii++] = b; idx[ii++] = c;
+            idx[ii++] = c; idx[ii++] = b; idx[ii++] = d;
+        }
+    }
+    return { vertices: verts, indices: idx };
+}
+
+const { vertices: QUAD_VERTICES, indices: QUAD_INDICES } = buildTessellatedQuad(MESH_TESS);
 
 /**
  * 每瓦片 UBO 数据 = 8 个 f32 = 32 字节：
@@ -106,12 +131,15 @@ export class RasterTileLayer extends Layer {
     private _pipeline!: GPURenderPipeline;
     private _sampler!: GPUSampler;
     private _quadBuffer!: GPUBuffer;
+    private _indexBuffer!: GPUBuffer;
     private _globalUbo!: GPUBuffer;
     private _globalBindGroup!: GPUBindGroup;
     private _tileBindGroupLayout!: GPUBindGroupLayout;
     private _tileUbo!: GPUBuffer;
     private _tileUboCapacity = 0;
     private _scratch = new Float32Array(8);
+    /** 全局 UBO 临时缓冲：16 floats viewProj + 4 floats flags = 80 bytes */
+    private _globalScratch = new Float32Array(20);
 
     constructor(opts: RasterTileLayerOptions) {
         super();
@@ -132,13 +160,21 @@ export class RasterTileLayer extends Layer {
     protected onAttach(engine: Engine): void {
         const device = engine.device;
 
-        // 顶点缓冲：所有瓦片共享同一个单位方块
+        // 顶点缓冲：所有瓦片共享同一个镶嵌单位方块
         this._quadBuffer = device.createBuffer({
             label: 'raster-quad-vb',
             size: QUAD_VERTICES.byteLength,
             usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
         });
         device.queue.writeBuffer(this._quadBuffer, 0, QUAD_VERTICES);
+
+        // 索引缓冲
+        this._indexBuffer = device.createBuffer({
+            label: 'raster-quad-ib',
+            size: QUAD_INDICES.byteLength,
+            usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+        });
+        device.queue.writeBuffer(this._indexBuffer, 0, QUAD_INDICES);
 
         // 采样器：双线性，clamp 防止跨瓦片串色
         this._sampler = device.createSampler({
@@ -150,10 +186,10 @@ export class RasterTileLayer extends Layer {
             addressModeV: 'clamp-to-edge',
         });
 
-        // 全局 UBO：viewProj mat4
+        // 全局 UBO：viewProj mat4 + flags vec4 = 80 bytes
         this._globalUbo = device.createBuffer({
             label: 'raster-global-ubo',
-            size: 64,
+            size: 80,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
@@ -220,11 +256,22 @@ export class RasterTileLayer extends Layer {
                     },
                 }],
             },
-            primitive: { topology: 'triangle-list', cullMode: 'none' },
+            primitive: {
+                topology: 'triangle-list',
+                // 镶嵌 quad 的索引顺序是 CW（从屏幕外看）；球面也是 CW 朝外
+                // 因此把 CW 作为正面，背面（地球远侧）被剔除以提升性能
+                frontFace: 'cw',
+                cullMode: 'back',
+            },
             depthStencil: {
                 format: 'depth24plus',
-                depthWriteEnabled: false,
-                depthCompare: 'always',
+                // 启用深度写入与测试：球体模式下让近面遮挡远面；
+                // 平面模式下所有瓦片同一 Z 平面，less-equal 允许正常覆写
+                depthWriteEnabled: true,
+                depthCompare: 'less-equal',
+            },
+            multisample: {
+                count: engine.sampleCount,
             },
         });
 
@@ -238,6 +285,7 @@ export class RasterTileLayer extends Layer {
     protected onDetach(): void {
         this._cache.clear();
         this._quadBuffer?.destroy();
+        this._indexBuffer?.destroy();
         this._globalUbo?.destroy();
         this._tileUbo?.destroy();
     }
@@ -248,24 +296,33 @@ export class RasterTileLayer extends Layer {
         const { engine, camera, pass, frame } = ctx;
         const device = engine.device;
 
-        // 1) 写全局 UBO
-        const vp = camera.getViewProjectionMatrix();
-        device.queue.writeBuffer(this._globalUbo, 0, vp as Float32Array);
+        // 1) 写全局 UBO（viewProj + flags）
+        const vp = camera.getViewProjectionMatrix() as Float32Array;
+        const isGlobe = camera.getProjection() === 'globe';
+        this._globalScratch.set(vp, 0);
+        this._globalScratch[16] = isGlobe ? 1 : 0;
+        this._globalScratch[17] = 0;
+        this._globalScratch[18] = 0;
+        this._globalScratch[19] = 0;
+        device.queue.writeBuffer(this._globalUbo, 0, this._globalScratch);
 
         // 2) 计算可见 ideal 瓦片
-        const idealCoords = TilePyramid.getVisibleTiles(
-            camera, this._source.minZoom, this._source.maxZoom,
-        );
+        const idealCoords = isGlobe
+            ? this._getGlobeVisibleTiles(camera)
+            : TilePyramid.getVisibleTiles(camera, this._source.minZoom, this._source.maxZoom);
         if (idealCoords.length === 0) return;
 
         // 3) 对 ideal 瓦片发起请求；同时 prefetch 父级
+        //    同时收集 ideal Tile 实例引用，避免后续因 LRU 淘汰而 cache miss
+        const idealTiles: Tile[] = [];
         for (const coord of idealCoords) {
-            const t = this._requestTile(coord);
+            const t = this._requestTile(coord, TileLoadPriority.Visible);
             t.lastUsedFrame = frame;
+            idealTiles.push(t);
             // 父级 prefetch：让 LRU 始终持有最近 N 级父级
             for (let d = 1; d <= this._parentPrefetchLevels && coord.z - d >= this._source.minZoom; d++) {
                 const pc: TileCoord = { z: coord.z - d, x: coord.x >> d, y: coord.y >> d };
-                const pt = this._requestTile(pc);
+                const pt = this._requestTile(pc, TileLoadPriority.Prefetch);
                 pt.lastUsedFrame = frame;
             }
         }
@@ -277,8 +334,9 @@ export class RasterTileLayer extends Layer {
         const tileDraws: DrawItem[] = [];
         const now = ctx.time;
 
-        for (const coord of idealCoords) {
-            const tile = this._cache.get(tileKey(coord))!; // 上面 _requestTile 已确保存在
+        for (let i = 0; i < idealCoords.length; i++) {
+            const coord = idealCoords[i];
+            const tile = idealTiles[i];
             const tw = Mercator.tileToWorld(coord);
 
             if (tile.state === TileState.Ready && tile.bindGroup) {
@@ -314,6 +372,7 @@ export class RasterTileLayer extends Layer {
         // 5) emit draws
         pass.setPipeline(this._pipeline);
         pass.setVertexBuffer(0, this._quadBuffer);
+        pass.setIndexBuffer(this._indexBuffer, 'uint16');
         pass.setBindGroup(0, this._globalBindGroup);
 
         // 背景按 z 升序（先大祖先，后近祖先），让近的覆盖远的
@@ -340,7 +399,7 @@ export class RasterTileLayer extends Layer {
         const off = drawIndex * TILE_UBO_STRIDE;
         device.queue.writeBuffer(this._tileUbo, off, s);
         pass.setBindGroup(1, d.source.bindGroup, [off]);
-        pass.draw(6, 1, 0, 0);
+        pass.drawIndexed(QUAD_INDICES.length, 1, 0, 0, 0);
         return drawIndex + 1;
     }
 
@@ -361,9 +420,9 @@ export class RasterTileLayer extends Layer {
      *   - Loaded → 立即上传 GPU
      *   - 其它   → 无动作
      */
-    private _requestTile(coord: TileCoord): Tile {
+    private _requestTile(coord: TileCoord, priority: number = TileLoadPriority.Visible): Tile {
         const tile = this._ensureTile(coord);
-        if (tile.state === TileState.Idle) {
+        if (tile.state === TileState.Idle || tile.state === TileState.Loading) {
             this._loader.request(tile, (t, err) => {
                 if (err) {
                     console.warn('[webgpu-geo] tile load failed:', t.key, err.message);
@@ -371,7 +430,7 @@ export class RasterTileLayer extends Layer {
                 }
                 this._uploadToGPU(t);
                 this.onChange();
-            });
+            }, priority);
         } else if (tile.state === TileState.Loaded) {
             this._uploadToGPU(tile);
         }
@@ -386,10 +445,111 @@ export class RasterTileLayer extends Layer {
             const n = 1 << z;
             for (let x = 0; x < n; x++) {
                 for (let y = 0; y < n; y++) {
-                    this._requestTile({ z, x, y });
+                    this._requestTile({ z, x, y }, TileLoadPriority.Base);
                 }
             }
         }
+    }
+
+    /**
+     * Globe 模式下的可见瓦片选择
+     *
+     * 算法：
+     *   1) targetZ = round(camera.zoom)
+     *   2) 计算可见角半径 = horizon angle + padding
+     *      horizon angle = acos(R / d)，R=1 是球半径，d 是相机距球心距离
+     *   3) 把可见角换算成 targetZ 下的瓦片半径（基于"每弧度对应多少瓦片"）
+     *   4) 仅枚举 center tile 周围这个矩形范围内的瓦片
+     *   5) 对每个候选瓦片用"瓦片中心到 view center 的球面距离"做最终精确剔除
+     *
+     * 这样既不会全图扫描（O(4^z) 太慢），又不会漏掉边缘瓦片。
+     */
+    private _getGlobeVisibleTiles(camera: import('../camera/Camera').Camera): TileCoord[] {
+        const center = camera.getCenter();
+        const d = camera.getGlobeDistance();
+        const horizonAng = Math.acos(Math.min(0.9999, 1 / d));
+        const fov = camera.getGlobeFovY();
+        const surfaceDist = Math.max(0.005, d - 1);
+
+        // ===== z 选择：按屏幕像素密度反推合适 z =====
+        const vh = Math.max(1, camera.viewportHeight);
+        const vw = Math.max(1, camera.viewportWidth);
+        const radPerPx = (surfaceDist * fov) / vh;
+        const desiredZ = Math.log2((2 * Math.PI) / Math.max(1e-9, 256 * radPerPx));
+        const targetZ = Math.max(
+            this._source.minZoom,
+            Math.min(this._source.maxZoom, Math.round(desiredZ)),
+        );
+        const n = 1 << targetZ;
+
+        // ===== 计算可视半角（弧度，球面中心角） =====
+        // 给定相机到球心 d、FOV 半角 α，球半径 1：
+        //   - 若 α >= asin(1/d)：视锥比切线还宽，能看到整个可见半球 → 使用 horizonAng
+        //   - 否则视锥与球面相交于 θ = atan2(t·sinα, d - t·cosα)，
+        //     其中 t = d·cosα − √(1 − d²sin²α)
+        const tangentHalfAng = Math.asin(Math.min(1, 1 / d));
+        const aspect = vw / vh;
+        const halfFovV = fov / 2;
+        const halfFovH = Math.atan(Math.tan(halfFovV) * aspect);
+        const visAngFor = (halfFov: number): number => {
+            if (halfFov >= tangentHalfAng) return horizonAng;
+            const sinA = Math.sin(halfFov);
+            const cosA = Math.cos(halfFov);
+            const disc = 1 - d * d * sinA * sinA;
+            if (disc <= 0) return horizonAng;
+            const t = d * cosA - Math.sqrt(disc);
+            const px = t * sinA;
+            const pz = d - t * cosA;
+            return Math.atan2(px, pz);
+        };
+        const visAngV = visAngFor(halfFovV);
+        const visAngH = visAngFor(halfFovH);
+        // 取较大者作为外接圆半径，再加一个瓦片角半径的 padding 防边缘漏裁
+        const tileAngRadius = (Math.SQRT2 * Math.PI) / n;
+        const visAng = Math.min(Math.PI, Math.max(visAngV, visAngH) + 1.5 * tileAngRadius);
+
+        const tilesPerRad = n / (2 * Math.PI);
+        const tileRadius = Math.min(n, Math.ceil(visAng * tilesPerRad) + 1);
+
+        const cTile = Mercator.lngLatToTile(center, targetZ);
+        const cx = Math.floor(cTile.x);
+        const cy = Math.floor(cTile.y);
+
+        const minY = Math.max(0, cy - tileRadius);
+        const maxY = Math.min(n - 1, cy + tileRadius);
+
+        const centerLat = (center.lat * Math.PI) / 180;
+        const centerLng = (center.lng * Math.PI) / 180;
+        const sinCL = Math.sin(centerLat);
+        const cosCL = Math.cos(centerLat);
+        const cosVis = Math.cos(Math.min(Math.PI, visAng + tileAngRadius));
+
+        const out: TileCoord[] = [];
+        const seen = new Set<number>();
+        for (let y = minY; y <= maxY; y++) {
+            for (let dx = -tileRadius; dx <= tileRadius; dx++) {
+                const rawX = cx + dx;
+                const x = ((rawX % n) + n) % n; // 经度环绕
+                // 去重（低 zoom 时 wrap 会让同一瓦片被多次枚举）
+                const id = y * n + x;
+                if (seen.has(id)) continue;
+                seen.add(id);
+                // 瓦片中心 → 经纬度
+                const wx = (x + 0.5) / n;
+                const wy = (y + 0.5) / n;
+                const ll = Mercator.worldToLngLat(wx, wy);
+                const lat = (ll.lat * Math.PI) / 180;
+                const lng = (ll.lng * Math.PI) / 180;
+                // cos(球面距离) = sinφ1 sinφ2 + cosφ1 cosφ2 cos(Δλ)
+                const cosD =
+                    sinCL * Math.sin(lat) +
+                    cosCL * Math.cos(lat) * Math.cos(lng - centerLng);
+                if (cosD >= cosVis) {
+                    out.push({ z: targetZ, x, y });
+                }
+            }
+        }
+        return out;
     }
 
     /**
@@ -411,13 +571,13 @@ export class RasterTileLayer extends Layer {
             const ay = coord.y >> d;
             const pc: TileCoord = { z: az, x: ax, y: ay };
             const anc = this._ensureTile(pc);
-            // 懒触发加载：填补 baseLoadZoom..idealZ 之间的祖先空洞
-            if (anc.state === TileState.Idle) {
+            // 懒触发加载：填补 baseLoadZoom..idealZ 之间的祖先空洞（按"兜底"优先级抢占）
+            if (anc.state === TileState.Idle || anc.state === TileState.Loading) {
                 this._loader.request(anc, (t, err) => {
                     if (err) return;
                     this._uploadToGPU(t);
                     this.onChange();
-                });
+                }, TileLoadPriority.Fallback);
             } else if (anc.state === TileState.Loaded) {
                 this._uploadToGPU(anc);
             }
