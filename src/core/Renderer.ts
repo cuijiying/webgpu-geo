@@ -65,8 +65,10 @@ export class Renderer {
         const tick = () => {
             if (!this._running) return;
             if (this._dirty) {
-                this._renderFrame();
+                // 先清 dirty：渲染过程中若有人再次 requestRender（如 resize / 异步 tile 上传），
+                // 不会被本帧结束时的赋值覆盖掉，下一帧会继续重绘
                 this._dirty = false;
+                this._renderFrame();
             }
             this._raf = requestAnimationFrame(tick);
         };
