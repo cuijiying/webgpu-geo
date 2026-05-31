@@ -29,12 +29,17 @@ export type TileLoadCallback = (tile: Tile, err?: Error) => void;
 export const TileLoadPriority = {
     /** 用户当前可见的 ideal 瓦片 */
     Visible: 100,
+    /**
+     * 启动时的世界底图预加载（z=0..baseLoadZoom）。
+     * 必须**高于** Visible —— 这些瓦片是所有缩放层级的"永久兜底"，
+     * 必须最先就绪，否则首屏会触发大量 Fallback 请求引起雪崩。
+     * 数量本就极少（baseLoadZoom=2 时仅 21 张），不会阻塞用户视图加载太久。
+     */
+    Base: 200,
     /** 立即兜底使用的祖先瓦片 */
     Fallback: 50,
     /** 父级缓存预取 */
     Prefetch: 10,
-    /** 启动时的世界底图预加载 */
-    Base: 1,
 } as const;
 
 interface QueueEntry {
@@ -58,7 +63,7 @@ export class TileLoader {
 
     constructor(source: TileSource, opts: TileLoaderOptions = {}) {
         this._source = source;
-        this._maxConcurrent = opts.maxConcurrent ?? 16;
+        this._maxConcurrent = opts.maxConcurrent ?? 6;
         this._fetchInit = opts.fetchInit ?? { mode: 'cors' };
     }
 

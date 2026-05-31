@@ -17,7 +17,7 @@ export interface RasterTileLayerOptions {
     source: TileSource;
     /** LRU 缓存容量（瓦片个数），默认 512 */
     cacheSize?: number;
-    /** 同时进行的 HTTP 请求数，默认 16 */
+    /** 同时进行的 HTTP 请求数，默认 6（贴合浏览器单域名连接上限） */
     maxConcurrent?: number;
     /** 是否启用淡入动画，默认 false（避免初始加载亮度差） */
     fadeIn?: boolean;
@@ -140,13 +140,22 @@ export class RasterTileLayer extends Layer {
     private _scratch = new Float32Array(8);
     /** 全局 UBO 临时缓冲：16 floats viewProj + 4 floats flags = 80 bytes */
     private _globalScratch = new Float32Array(20);
+    /** globe 模式上一帧选定的瓦片层级，用于滞回，避免 0.5 边界处反复跳变 */
+    private _lastGlobeZ = -1;
+    /**
+     * 当前在途（Idle 入队 / Loading）但尚未 Ready 的瓦片集合。
+     * 每帧渲染末尾，凡 `lastUsedFrame` 不等于当前帧、且未被钉固者，
+     * 说明已滚出视野 → 立即取消，释放浏览器连接槽，避免高层级
+     * 快速平移/缩放时旧请求长期 pending 阻塞新进入视野的瓦片。
+     */
+    private _inflight = new Set<Tile>();
 
     constructor(opts: RasterTileLayerOptions) {
         super();
         this._source = opts.source;
         this._cache = new TileCache(opts.cacheSize ?? 512);
         this._loader = new TileLoader(this._source, {
-            maxConcurrent: opts.maxConcurrent ?? 16,
+            maxConcurrent: opts.maxConcurrent ?? 6,
         });
         this._fadeIn = opts.fadeIn ?? false;
         this._fadeDuration = opts.fadeDuration ?? 200;
@@ -314,16 +323,41 @@ export class RasterTileLayer extends Layer {
 
         // 3) 对 ideal 瓦片发起请求；同时 prefetch 父级
         //    同时收集 ideal Tile 实例引用，避免后续因 LRU 淘汰而 cache miss
+        //    Prefetch 设每帧预算上限，避免小比例尺一次性入队上百个 prefetch 拖垮队列
         const idealTiles: Tile[] = [];
+        const PREFETCH_BUDGET_PER_FRAME = 32;
+        let prefetchBudget = PREFETCH_BUDGET_PER_FRAME;
         for (const coord of idealCoords) {
             const t = this._requestTile(coord, TileLoadPriority.Visible);
             t.lastUsedFrame = frame;
             idealTiles.push(t);
             // 父级 prefetch：让 LRU 始终持有最近 N 级父级
             for (let d = 1; d <= this._parentPrefetchLevels && coord.z - d >= this._source.minZoom; d++) {
+                if (prefetchBudget <= 0) break;
                 const pc: TileCoord = { z: coord.z - d, x: coord.x >> d, y: coord.y >> d };
+                const key = tileKey(pc);
+                const existing = this._cache.get(key);
+                // 已存在且不需重新请求 → 仅刷新 LRU 位置，不计入预算
+                if (existing && existing.state !== TileState.Idle) {
+                    existing.lastUsedFrame = frame;
+                    continue;
+                }
                 const pt = this._requestTile(pc, TileLoadPriority.Prefetch);
                 pt.lastUsedFrame = frame;
+                prefetchBudget--;
+            }
+        }
+
+        // 3.5) 取消上一帧请求、但本帧已不再需要（滚出视野）的在途瓦片。
+        //      高层级快速平移/缩放时这是关键：及时 abort 让出浏览器连接槽，
+        //      使新进入视野的瓦片不必排在大量陈旧 pending 请求之后。
+        //      钉固的世界底图（base）永不取消。
+        if (this._inflight.size > 0) {
+            for (const t of this._inflight) {
+                if (t.lastUsedFrame !== frame && !this._cache.isPinned(t.key)) {
+                    this._loader.cancel(t);
+                    this._inflight.delete(t);
+                }
             }
         }
 
@@ -423,7 +457,9 @@ export class RasterTileLayer extends Layer {
     private _requestTile(coord: TileCoord, priority: number = TileLoadPriority.Visible): Tile {
         const tile = this._ensureTile(coord);
         if (tile.state === TileState.Idle || tile.state === TileState.Loading) {
+            this._inflight.add(tile);
             this._loader.request(tile, (t, err) => {
+                this._inflight.delete(t);
                 if (err) {
                     console.warn('[webgpu-geo] tile load failed:', t.key, err.message);
                     return;
@@ -437,7 +473,7 @@ export class RasterTileLayer extends Layer {
         return tile;
     }
 
-    /** 预加载世界底图（z=0..baseLoadZoom），作为永久兜底父级 */
+    /** 预加载世界底图（z=0..baseLoadZoom），并**钉固**为永久兜底地板（永不被 LRU 淘汰） */
     private _preloadBaseTiles(): void {
         if (this._baseLoadZoom < this._source.minZoom) return;
         const top = Math.min(this._baseLoadZoom, this._source.maxZoom);
@@ -445,7 +481,10 @@ export class RasterTileLayer extends Layer {
             const n = 1 << z;
             for (let x = 0; x < n; x++) {
                 for (let y = 0; y < n; y++) {
-                    this._requestTile({ z, x, y }, TileLoadPriority.Base);
+                    const coord = { z, x, y };
+                    this._requestTile(coord, TileLoadPriority.Base);
+                    // 钉固：保证任何缩放层级下 fallback 都有可用地板，杜绝空白
+                    this._cache.pin(tileKey(coord));
                 }
             }
         }
@@ -471,15 +510,35 @@ export class RasterTileLayer extends Layer {
         const fov = camera.getGlobeFovY();
         const surfaceDist = Math.max(0.005, d - 1);
 
-        // ===== z 选择：按屏幕像素密度反推合适 z =====
+        // ===== z 选择：以"屏幕像素密度反推"为权威，camera.zoom 仅作下限保护 =====
+        // globe 模式下 camera.zoom 控制的是距离公式 d=1+(d0-1)/2^zoom，
+        // 与 mercator 中"zoom=z 表示瓦片宽=viewport/2^z"完全不同：
+        //   zoom=2 时 d≈1.35，视口里可见弧长仅占赤道的 ~18%，需要 z≈6 的瓦片才能 1:1。
+        // 所以这里必须用 desiredZ（按 radPerPx 反算）作为渲染细节级，
+        // 否则远低于 desiredZ 会看到极度拉伸的糊图。
+        // 卡顿问题已由 fallback 节流 + Base 优先级 + prefetch 预算 解决，无需在此封顶。
         const vh = Math.max(1, camera.viewportHeight);
         const vw = Math.max(1, camera.viewportWidth);
         const radPerPx = (surfaceDist * fov) / vh;
         const desiredZ = Math.log2((2 * Math.PI) / Math.max(1e-9, 256 * radPerPx));
-        const targetZ = Math.max(
-            this._source.minZoom,
-            Math.min(this._source.maxZoom, Math.round(desiredZ)),
-        );
+        const camZ = camera.getZoom();
+        const idealF = Math.max(desiredZ, camZ);
+        const loZ = this._source.minZoom;
+        const hiZ = this._source.maxZoom;
+        // ===== 滞回（hysteresis）：用 ±0.6 死区 + 单步切换，避免缩放过程中 targetZ
+        //       在两个整数间反复跳变引发"请求一整套新瓦片→GPU 上传风暴→闪烁" =====
+        let targetZ: number;
+        if (this._lastGlobeZ < 0) {
+            targetZ = Math.round(idealF);
+        } else if (idealF > this._lastGlobeZ + 0.6) {
+            targetZ = this._lastGlobeZ + 1;   // 需要更清晰，升一级
+        } else if (idealF < this._lastGlobeZ - 0.6) {
+            targetZ = this._lastGlobeZ - 1;   // 可以更粗，降一级
+        } else {
+            targetZ = this._lastGlobeZ;       // 落在死区内，保持不变
+        }
+        targetZ = Math.max(loZ, Math.min(hiZ, targetZ));
+        this._lastGlobeZ = targetZ;
         const n = 1 << targetZ;
 
         // ===== 计算可视半角（弧度，球面中心角） =====
@@ -555,51 +614,40 @@ export class RasterTileLayer extends Layer {
     /**
      * 为某 ideal 坐标构造一条用最近 Ready 祖先填充的 DrawItem。
      *
-     * **关键优化**：在向上搜索过程中，对遇到的 Idle 祖先**立即发起加载**。
-     * 这样即使首次因没有中间层级而只能用 z=baseLoadZoom 极度拉伸的纹理兜底，
-     * 后续帧会逐渐有更高分辨率的中间祖先就绪，画面持续清晰化。
-     * 这是 Mapbox "on-demand parent loading" 的核心机制。
+     * **零副作用、零请求**：
+     *   - 只用 `cache.peek` 向上查找最近的 Ready 祖先（不刷新 LRU、不创建 Tile、不入队请求）
+     *   - base 底图已被钉固且必然就绪 → 任何 ideal（z≥minZoom）都至少能回退到 base 地板，
+     *     因此**永不返回 null、永不空白**
+     *
+     * 中间层级的逐渐清晰化由 ideal 直接加载 + 每帧 prefetch 共同驱动，
+     * 不再在此处逐级 `_loader.request` —— 那会在缩放瞬间产生数百次入队风暴。
      */
     private _buildFallbackDraw(
         coord: TileCoord,
         tw: { x: number; y: number; size: number },
     ): DrawItem | null {
-        let best: DrawItem | null = null;
-        for (let d = 1; d <= this._maxParentLookup && coord.z - d >= this._source.minZoom; d++) {
+        const maxLookup = Math.min(this._maxParentLookup, coord.z - this._source.minZoom);
+        for (let d = 1; d <= maxLookup; d++) {
             const az = coord.z - d;
             const ax = coord.x >> d;
             const ay = coord.y >> d;
-            const pc: TileCoord = { z: az, x: ax, y: ay };
-            const anc = this._ensureTile(pc);
-            // 懒触发加载：填补 baseLoadZoom..idealZ 之间的祖先空洞（按"兜底"优先级抢占）
-            if (anc.state === TileState.Idle || anc.state === TileState.Loading) {
-                this._loader.request(anc, (t, err) => {
-                    if (err) return;
-                    this._uploadToGPU(t);
-                    this.onChange();
-                }, TileLoadPriority.Fallback);
-            } else if (anc.state === TileState.Loaded) {
-                this._uploadToGPU(anc);
-            }
-            // 找到最近的 Ready 祖先即可返回（向上是越来越粗糙）
-            if (anc.state === TileState.Ready && anc.bindGroup && !best) {
-                const n = 1 << d;
+            const anc = this._cache.peek(tileKey({ z: az, x: ax, y: ay }));
+            if (anc && anc.state === TileState.Ready && anc.bindGroup) {
+                const denom = 1 << d;
                 const localX = coord.x - (ax << d);
                 const localY = coord.y - (ay << d);
-                best = {
+                return {
                     source: anc,
                     worldX: tw.x, worldY: tw.y, worldSize: tw.size,
-                    uvX: localX / n,
-                    uvY: localY / n,
-                    uvScaleX: 1 / n,
-                    uvScaleY: 1 / n,
+                    uvX: localX / denom,
+                    uvY: localY / denom,
+                    uvScaleX: 1 / denom,
+                    uvScaleY: 1 / denom,
                     opacity: 1,
                 };
-                // 找到一个就够了：返回，但循环里也已经在 ensure idle 的祖先了
-                return best;
             }
         }
-        return best;
+        return null;
     }
 
     /** 将 Loaded 瓦片的 ImageBitmap 上传到 GPU 纹理 */
