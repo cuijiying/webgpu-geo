@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>webgpu-geo · 事件体系测试</title>
+    <style>
+        html, body { margin: 0; padding: 0; height: 100%; background: #0c1014; overflow: hidden; }
+        #map { width: 100%; height: 100%; display: block; }
+        .hud {
+            position: absolute; top: 10px; left: 10px;
+            background: rgba(0,0,0,.7); color: #fff;
+            padding: 12px 14px; border-radius: 8px;
+            font: 12px/1.6 -apple-system, "Segoe UI", sans-serif;
+            user-select: none; width: 260px;
+        }
+        .hud b { color: #6cf; }
+        .hud h3 { margin: 0 0 8px; font-size: 13px; color: #9fe; }
+        .hud .row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+        .hud button {
+            cursor: pointer; border: 1px solid #345; background: #1a2530;
+            color: #cdf; border-radius: 5px; padding: 4px 8px; font-size: 12px;
+        }
+        .hud button:hover { background: #25323f; }
+        .info { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2a3a47; }
+        .log {
+            position: absolute; right: 10px; top: 10px; bottom: 10px; width: 300px;
+            background: rgba(0,0,0,.7); color: #cde; border-radius: 8px;
+            font: 11px/1.5 ui-monospace, Menlo, Consolas, monospace;
+            padding: 10px; overflow: auto;
+        }
+        .log .e { padding: 2px 4px; border-bottom: 1px solid #1c2730; }
+        .log .e.click { color: #ffd166; }
+        .log .e.feat { color: #7bed9f; }
+        .log .e.move { color: #74b9ff; }
+        .log .e.zoom { color: #a29bfe; }
+        .log .e.rot { color: #fab1a0; }
+        .tip {
+            position: absolute; pointer-events: none; transform: translate(-50%, -130%);
+            background: #111c; color: #fff; padding: 4px 8px; border-radius: 5px;
+            font: 12px/1.4 sans-serif; display: none; white-space: nowrap; border: 1px solid #3bb2d0;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="map"></canvas>
+    <div class="hud">
+        <h3>事件体系测试</h3>
+        <div>左键拖拽平移 · 右键拖拽旋转/俯仰 · 滚轮缩放</div>
+        <div class="info">
+            指针经纬度: <b id="ll">-</b><br>
+            屏幕坐标: <b id="pt">-</b><br>
+            center: <b id="center">-</b><br>
+            zoom: <b id="zoom">-</b> · bearing: <b id="bearing">-</b> · pitch: <b id="pitch">-</b>
+        </div>
+        <div class="row">
+            <button id="btn-2d">2D 平面</button>
+            <button id="btn-3d">3D 球体</button>
+            <button id="btn-pitch">俯仰 +15°</button>
+            <button id="btn-reset">复位视角</button>
+            <button id="btn-clear">清空日志</button>
+        </div>
+    </div>
+    <div class="log" id="log"></div>
+    <div class="tip" id="tip"></div>
+
+    <script>document.write('<script src="../dist/aimap-dev.umd.js?v=' + Date.now() + '"><\/script>');</script>
+    <script>
+    (async function () {
+        const cities = {
+            type: 'FeatureCollection',
+            features: [
+                ['北京', 116.4074, 39.9042, '#e63946'],
+                ['上海', 121.4737, 31.2304, '#457b9d'],
+                ['广州', 113.2644, 23.1291, '#2a9d8f'],
+                ['成都', 104.0665, 30.5728, '#e9c46a'],
+                ['乌鲁木齐', 87.6168, 43.8256, '#9b5de5'],
+            ].map((c) => ({
+                type: 'Feature',
+                properties: { name: c[0], color: c[3] },
+                geometry: { type: 'Point', coordinates: [c[1], c[2]] }
+            }))
+        };
+
+        const provinces = {
+            type: 'FeatureCollection',
+            features: [
+                {
+                    type: 'Feature',
+                    properties: { name: '示意区域 A', color: '#f4a261' },
+                    geometry: {
+                        type: 'Polygon',
+                        coordinates: [[[100, 25], [115, 25], [115, 40], [100, 40], [100, 25]]]
+                    }
+                },
+                {
+                    type: 'Feature',
+                    properties: { name: '示意区域 B', color: '#2a9d8f' },
+                    geometry: {
+                        type: 'Polygon',
+                        coordinates: [[[118, 28], [128, 30], [126, 42], [116, 44], [118, 28]]]
+                    }
+                }
+            ]
+        };
+
+        const route = {
+            type: 'FeatureCollection',
+            features: [{
+                type: 'Feature',
+                properties: { name: '示意路径' },
+                geometry: {
+                    type: 'LineString',
+                    coordinates: [[90, 45], [100, 40], [116.4, 39.9], [121.5, 31.2], [113.3, 23.1]]
+                }
+            }]
+        };
+
+        const map = new ai.Map({
+            container: 'map',
+            center: { lng: 110, lat: 34 },
+            zoom: 3,
+            minZoom: 0,
+            maxZoom: 19,
+            projection: 'mercator',
+            tileSource: {
+                url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                subdomains: ['a', 'b', 'c']
+            }
+        });
+        await map.ready();
+
+        const fillLayer = map.addGeoJSON({
+            id: 'provinces',
+            data: provinces,
+            paint: { fillColor: ['get', 'color'], fillOpacity: 0.45, fillOutlineColor: '#fff', fillOutlineWidth: 1.5 }
+        });
+        const lineLayer = map.addGeoJSON({
+            id: 'route',
+            data: route,
+            paint: { lineColor: '#ffd166', lineWidth: 4, lineOpacity: 0.95 }
+        });
+        const pointLayer = map.addGeoJSON({
+            id: 'cities',
+            data: cities,
+            paint: { circleColor: ['get', 'color'], circleRadius: 8, circleStrokeColor: '#fff', circleStrokeWidth: 2 }
+        });
+
+        // ---------- 日志 ----------
+        const $log = document.getElementById('log');
+        function log(msg, cls) {
+            const div = document.createElement('div');
+            div.className = 'e ' + (cls || '');
+            div.textContent = msg;
+            $log.prepend(div);
+            while ($log.childElementCount > 80) $log.lastChild.remove();
+        }
+        document.getElementById('btn-clear').onclick = () => ($log.innerHTML = '');
+
+        // ---------- 地图级事件 ----------
+        const $ll = document.getElementById('ll');
+        const $pt = document.getElementById('pt');
+        map.on('mousemove', (e) => {
+            $ll.textContent = e.lngLat.lng.toFixed(3) + ', ' + e.lngLat.lat.toFixed(3);
+            $pt.textContent = e.point.x.toFixed(0) + ', ' + e.point.y.toFixed(0);
+        });
+        map.on('click', (e) => {
+            log('🖱 click @ ' + e.lngLat.lng.toFixed(2) + ',' + e.lngLat.lat.toFixed(2)
+                + (e.features ? ' → ' + (e.features[0].properties.name || '要素') : ''), 'click');
+        });
+        map.on('dblclick', () => log('🖱 dblclick', 'click'));
+        map.on('contextmenu', () => log('🖱 右键菜单', 'click'));
+
+        // 视图变换事件
+        const $c = document.getElementById('center');
+        const $z = document.getElementById('zoom');
+        const $b = document.getElementById('bearing');
+        const $p = document.getElementById('pitch');
+        function hud() {
+            const c = map.getCenter();
+            $c.textContent = c.lng.toFixed(3) + ', ' + c.lat.toFixed(3);
+            $z.textContent = map.getZoom().toFixed(2);
+            $b.textContent = map.getBearing().toFixed(1) + '°';
+            $p.textContent = map.getPitch().toFixed(1) + '°';
+        }
+        map.on('movestart', () => log('▶ movestart', 'move'));
+        map.on('move', hud);
+        map.on('moveend', () => log('⏹ moveend', 'move'));
+        map.on('zoomstart', () => log('▶ zoomstart', 'zoom'));
+        map.on('zoomend', () => log('⏹ zoomend · z=' + map.getZoom().toFixed(2), 'zoom'));
+        map.on('rotatestart', () => log('▶ rotatestart', 'rot'));
+        map.on('rotateend', () => log('⏹ rotateend · bearing=' + map.getBearing().toFixed(1) + '°', 'rot'));
+        map.on('pitchstart', () => log('▶ pitchstart', 'rot'));
+        map.on('pitchend', () => log('⏹ pitchend · pitch=' + map.getPitch().toFixed(1) + '°', 'rot'));
+        map.on('dragstart', () => log('✊ dragstart', 'move'));
+        map.on('dragend', () => log('✋ dragend', 'move'));
+        map.on('load', () => log('✅ load'));
+        map.on('resize', () => log('↔ resize'));
+        hud();
+
+        // ---------- 图层级事件（要素拾取） ----------
+        const $tip = document.getElementById('tip');
+        function showTip(e, text) {
+            $tip.textContent = text;
+            $tip.style.left = e.point.x + 'px';
+            $tip.style.top = e.point.y + 'px';
+            $tip.style.display = 'block';
+        }
+        function hideTip() { $tip.style.display = 'none'; }
+
+        ['cities', 'provinces', 'route'].forEach((id) => {
+            map.on('click', id, (e) => {
+                const f = e.features[0];
+                log('🎯 [' + id + '] 命中: ' + (f.properties.name || JSON.stringify(f.properties)), 'feat');
+            });
+            map.on('mouseenter', id, (e) => {
+                map.engine.canvas.style.cursor = 'pointer';
+                const f = e.features && e.features[0];
+                if (f) showTip(e, f.properties.name || id);
+            });
+            map.on('mousemove', id, (e) => {
+                const f = e.features && e.features[0];
+                if (f) showTip(e, f.properties.name || id);
+            });
+            map.on('mouseleave', id, () => {
+                map.engine.canvas.style.cursor = '';
+                hideTip();
+            });
+        });
+
+        // ---------- 投影切换 ----------
+        document.getElementById('btn-2d').onclick = () => map.setProjection('mercator');
+        document.getElementById('btn-3d').onclick = () => map.setProjection('globe');
+        document.getElementById('btn-pitch').onclick = () => map.setPitch(Math.min(60, map.getPitch() + 15));
+        document.getElementById('btn-reset').onclick = () => { map.setBearing(0); map.setPitch(0); };
+
+        window.map = map;
+        log('提示：右键拖拽可旋转方位角并改变俯仰角（2D/3D 通用）');
+        log('提示：把鼠标移到城市点 / 区域上试试悬停与点击');
+    })().catch(function (err) {
+        document.body.innerHTML = '<div style="color:#fff;padding:24px;font-family:sans-serif">' +
+            '<h2>初始化失败</h2><pre>' + err.stack + '</pre></div>';
+    });
+    </script>
+</body>
+</html>

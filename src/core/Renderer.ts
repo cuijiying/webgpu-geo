@@ -58,6 +58,11 @@ export class Renderer {
         this.requestRender();
     }
 
+    /** 当前图层列表（只读快照，按绘制顺序：靠后者在上层） */
+    get layers(): readonly Layer[] {
+        return this._layers;
+    }
+
     /** 启动渲染循环（按需重绘） */
     start(): void {
         if (this._running) return;

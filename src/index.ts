@@ -20,4 +20,12 @@ export { TilePyramid } from './tile/TilePyramid';
 export { Tile, TileState } from './tile/Tile';
 export { Mercator } from './geo/Mercator';
 export type { LngLat, TileCoord, WorldBounds, PixelXY } from './geo/types';
+// 事件体系
+export { Evented, type EventListener } from './events/Evented';
+export type {
+    MapMouseEvent, MapWheelEvent, MapTouchEvent, MapCameraEvent, MapErrorEvent,
+    MapMouseEventType, MapLayerEventType, MapCameraEventType, MapLifecycleEventType,
+    QueryOptions, PickedFeature,
+} from './events/MapEvent';
+export type { ScreenProjection } from './camera/Camera';
 

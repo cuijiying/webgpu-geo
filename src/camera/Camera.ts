@@ -1,6 +1,16 @@
-import { mat4, vec3 } from 'gl-matrix';
+import { mat4, vec3, vec4 } from 'gl-matrix';
 import type { LngLat, WorldBounds } from '../geo/types';
 import { Mercator } from '../geo/Mercator';
+
+/** 世界坐标 → 屏幕坐标的投影结果 */
+export interface ScreenProjection {
+    /** canvas 内 CSS 像素 X */
+    x: number;
+    /** canvas 内 CSS 像素 Y */
+    y: number;
+    /** 在 globe 模式下该点是否位于可见半球（mercator 恒为 true） */
+    visible: boolean;
+}
 
 export type CameraChangeListener = () => void;
 
@@ -23,6 +33,10 @@ export class Camera {
     static readonly TILE_SIZE = 256;
     /** globe 模式透视 FOV（弧度） */
     static readonly FOV_Y = (45 * Math.PI) / 180;
+    /** mercator 倾斜（pitch）时使用的透视 FOV（弧度，约 36.87°，与 mapbox 一致） */
+    static readonly MERCATOR_FOV = 0.6435011087932844;
+    /** 最大俯仰角（弧度，60°） */
+    static readonly MAX_PITCH = (60 * Math.PI) / 180;
     /** globe 模式相机离球心最近距离 */
     static readonly MIN_GLOBE_DIST = 1.05;
 
@@ -109,7 +123,7 @@ export class Camera {
     getBearing(): number { return this._bearing; }
 
     setPitch(rad: number): void {
-        const clamped = Math.max(0, Math.min(Math.PI / 3, rad));
+        const clamped = Math.max(0, Math.min(Camera.MAX_PITCH, rad));
         if (clamped === this._pitch) return;
         this._pitch = clamped;
         this._dirty = true;
@@ -120,9 +134,9 @@ export class Camera {
     // ====================== 平面交互辅助（mercator 严格正确；globe 近似） ======================
     zoomAround(deltaZoom: number, px: number, py: number, dpr: number): void {
         if (this._projection === 'mercator') {
-            const before = this.screenToWorld(px, py, dpr);
+            const before = this.unprojectToWorld(px, py, dpr) ?? this.screenToWorld(px, py, dpr);
             this.setZoom(this._zoom + deltaZoom);
-            const after = this.screenToWorld(px, py, dpr);
+            const after = this.unprojectToWorld(px, py, dpr) ?? this.screenToWorld(px, py, dpr);
             this.setCenterWorld(
                 this._center.x + (before.x - after.x),
                 this._center.y + (before.y - after.y),
@@ -167,6 +181,133 @@ export class Camera {
             maxY: Math.min(1, this._center.y + halfH),
         };
     }
+
+    // ====================== 世界 → 屏幕 投影（拾取 / project 用） ======================
+    /**
+     * 世界坐标 → 屏幕 CSS 像素。
+     *   - mercator：正交反算，精确
+     *   - globe   ：复用着色器的 mercator→球面映射，经 viewProj 投影到裁剪空间，
+     *               再换算到屏幕；并按地平线 dot 阈值判定可见半球
+     */
+    projectWorld(x: number, y: number, dpr: number): ScreenProjection {
+        if (this._projection === 'mercator') {
+            if (this._pitch === 0 && this._bearing === 0) {
+                // 正交快速路径
+                const upp = this.worldUnitsPerPixel();
+                const cx = this._viewportW / 2 / dpr;
+                const cy = this._viewportH / 2 / dpr;
+                return {
+                    x: cx + (x - this._center.x) / (upp * dpr),
+                    y: cy + (y - this._center.y) / (upp * dpr),
+                    visible: true,
+                };
+            }
+            // 倾斜/旋转：用 viewProj 矩阵投影平面点 (x, y, 0)
+            const vp = this.getViewProjectionMatrix();
+            const clip = vec4.transformMat4(
+                vec4.create(), vec4.fromValues(x, y, 0, 1), vp,
+            );
+            if (clip[3] <= 0) return { x: NaN, y: NaN, visible: false }; // 位于相机后方
+            const ndcX = clip[0] / clip[3];
+            const ndcY = clip[1] / clip[3];
+            return {
+                x: (ndcX * 0.5 + 0.5) * (this._viewportW / dpr),
+                y: (1 - (ndcY * 0.5 + 0.5)) * (this._viewportH / dpr),
+                visible: true,
+            };
+        }
+        // globe
+        const p = Camera.worldToSphere(x, y);
+        const vp = this.getViewProjectionMatrix();
+        const clip = vec4.transformMat4(
+            vec4.create(),
+            vec4.fromValues(p[0], p[1], p[2], 1),
+            vp,
+        );
+        if (clip[3] === 0) return { x: NaN, y: NaN, visible: false };
+        const ndcX = clip[0] / clip[3];
+        const ndcY = clip[1] / clip[3];
+        const sx = (ndcX * 0.5 + 0.5) * (this._viewportW / dpr);
+        const sy = (1 - (ndcY * 0.5 + 0.5)) * (this._viewportH / dpr);
+        // 地平线剔除：可见半球阈值 cosθ = 1/d（与着色器 params2.w 一致）
+        const center = Camera.worldToSphere(this._center.x, this._center.y);
+        const dot = p[0] * center[0] + p[1] * center[1] + p[2] * center[2];
+        const visible = dot >= 1 / this.getGlobeDistance();
+        return { x: sx, y: sy, visible };
+    }
+
+    /**
+     * 屏幕 CSS 像素 → 世界坐标（screenToWorld 的精确版本）。
+     *   - mercator：直接反算
+     *   - globe   ：相机射线与单位球求交，取近交点再反映射回世界坐标；
+     *               未命中地球时返回 null
+     */
+    unprojectToWorld(px: number, py: number, dpr: number): { x: number; y: number } | null {
+        if (this._projection === 'mercator') {
+            if (this._pitch === 0 && this._bearing === 0) {
+                return this.screenToWorld(px, py, dpr);
+            }
+            // 倾斜/旋转：构造世界射线，与地图平面 z=0 求交
+            const vp = this.getViewProjectionMatrix();
+            const inv = mat4.invert(mat4.create(), vp);
+            if (!inv) return null;
+            const ndcX = (px * dpr) / this._viewportW * 2 - 1;
+            const ndcY = 1 - (py * dpr) / this._viewportH * 2;
+            const near = vec4.transformMat4(vec4.create(), vec4.fromValues(ndcX, ndcY, 0, 1), inv);
+            const far = vec4.transformMat4(vec4.create(), vec4.fromValues(ndcX, ndcY, 1, 1), inv);
+            const ox = near[0] / near[3], oy = near[1] / near[3], oz = near[2] / near[3];
+            const fx = far[0] / far[3], fy = far[1] / far[3], fz = far[2] / far[3];
+            const dz = fz - oz;
+            if (Math.abs(dz) < 1e-9) return null;       // 射线平行于地面
+            const t = -oz / dz;                          // 与 z=0 平面交点参数
+            if (t < 0) return null;                      // 交点在相机后方（地平线以上）
+            return { x: ox + (fx - ox) * t, y: oy + (fy - oy) * t };
+        }
+        // globe：构造世界射线，与单位球求交
+        const vp = this.getViewProjectionMatrix();
+        const inv = mat4.invert(mat4.create(), vp);
+        if (!inv) return null;
+        const ndcX = (px * dpr) / this._viewportW * 2 - 1;
+        const ndcY = 1 - (py * dpr) / this._viewportH * 2;
+        const near = vec4.transformMat4(vec4.create(), vec4.fromValues(ndcX, ndcY, 0, 1), inv);
+        const far = vec4.transformMat4(vec4.create(), vec4.fromValues(ndcX, ndcY, 1, 1), inv);
+        const o = vec3.fromValues(near[0] / near[3], near[1] / near[3], near[2] / near[3]);
+        const f = vec3.fromValues(far[0] / far[3], far[1] / far[3], far[2] / far[3]);
+        const dir = vec3.sub(vec3.create(), f, o);
+        vec3.normalize(dir, dir);
+        // |o + t·dir|² = 1
+        const b = 2 * vec3.dot(o, dir);
+        const c = vec3.dot(o, o) - 1;
+        const disc = b * b - 4 * c;
+        if (disc < 0) return null;
+        const sqrt = Math.sqrt(disc);
+        const t = (-b - sqrt) / 2;
+        const tHit = t >= 0 ? t : (-b + sqrt) / 2;
+        if (tHit < 0) return null;
+        const hit = vec3.scaleAndAdd(vec3.create(), o, dir, tHit);
+        return Camera.sphereToWorld(hit[0], hit[1], hit[2]);
+    }
+
+    /** 世界坐标(归一化 Mercator) → 单位球面点（复刻着色器 mercator_to_sphere） */
+    static worldToSphere(x: number, y: number): [number, number, number] {
+        const lng = (x - 0.5) * 2 * Math.PI;
+        const yn = 1 - 2 * y;
+        const s = Math.sinh(Math.PI * yn);
+        const lat = Math.atan(s);
+        const cl = Math.cos(lat);
+        return [cl * Math.sin(lng), Math.sin(lat), cl * Math.cos(lng)];
+    }
+
+    /** 单位球面点 → 世界坐标(归一化 Mercator)（worldToSphere 的逆） */
+    static sphereToWorld(x: number, y: number, z: number): { x: number; y: number } {
+        const lat = Math.asin(Math.max(-1, Math.min(1, y)));
+        const lng = Math.atan2(x, z);
+        const wx = lng / (2 * Math.PI) + 0.5;
+        const yn = Math.asinh(Math.tan(lat)) / Math.PI;
+        const wy = (1 - yn) / 2;
+        return { x: wx, y: wy };
+    }
+
 
     // ====================== globe 模式参数 ======================
     /**
@@ -224,55 +365,118 @@ export class Camera {
         }
     }
 
+    // ====================== mercator 透视倾斜矩阵 ======================
+    /**
+     * 构建 mercator 倾斜（pitch>0）时的透视 viewProj 矩阵。
+     *
+     * 思路（与 mapbox-gl 一致）：地图位于 z=0 平面（世界坐标 [0,1]），
+     * 相机置于中心点正上方距离 cameraDist 处，先按 pitch 绕屏幕水平轴后仰、
+     * 再按 bearing 绕竖直轴旋转。cameraDist = halfH / tan(fov/2) 保证 pitch=0
+     * 时与正交投影在中心处等价（缩放比例一致）。
+     *
+     * 世界 Y 轴向南增大，这里通过翻转 Y（scaleY(-1)）使屏幕上方对应北方。
+     */
+    private _buildMercatorPerspective(out: mat4): void {
+        const upp = this.worldUnitsPerPixel();
+        const halfH = (this._viewportH / 2) * upp;       // 视口半高（世界单位）
+        const aspect = this._viewportW / this._viewportH;
+        const fovY = Camera.MERCATOR_FOV;
+        const cameraDist = halfH / Math.tan(fovY / 2);    // 相机到中心平面距离（世界单位）
+        const pitch = this._pitch;
+
+        // 远裁剪面：随俯仰增大而变远，保证倾斜后仍能看到远处地面
+        const fovAbove = fovY / 2;
+        const groundAngle = Math.PI / 2 + pitch;
+        const topHalfSurfaceDist =
+            (Math.sin(fovAbove) * cameraDist) /
+            Math.sin(Math.max(0.01, Math.PI - groundAngle - fovAbove));
+        const farZ = (Math.cos(Math.PI / 2 - pitch) * topHalfSurfaceDist + cameraDist) * 1.2;
+        const nearZ = cameraDist * 0.1;
+
+        const proj = mat4.create();
+        mat4.perspective(proj, fovY, aspect, nearZ, farZ);
+
+        // view = T(0,0,-d) · Rx(-pitch) · Rz(-bearing) · [翻转Y并平移到中心]
+        const view = mat4.create();
+        mat4.translate(view, view, [0, 0, -cameraDist]);
+        mat4.rotateX(view, view, -pitch);
+        mat4.rotateZ(view, view, -this._bearing);
+        // 居中 + 翻转 Y：point' = (x-cx, -(y-cy), 0)
+        const center = mat4.create();
+        mat4.scale(center, center, [1, -1, 1]);
+        mat4.translate(center, center, [-this._center.x, -this._center.y, 0]);
+        mat4.multiply(view, view, center);
+
+        mat4.multiply(out, proj, view);
+    }
+
     // ====================== 投影矩阵 ======================
     getViewProjectionMatrix(): mat4 {
         if (!this._dirty) return this._viewProj;
 
         if (this._projection === 'mercator') {
-            const upp = this.worldUnitsPerPixel();
-            const halfW = (this._viewportW / 2) * upp;
-            const halfH = (this._viewportH / 2) * upp;
-            const left = this._center.x - halfW;
-            const right = this._center.x + halfW;
-            const bottom = this._center.y + halfH;
-            const top = this._center.y - halfH;
-            mat4.ortho(this._viewProj, left, right, bottom, top, -1, 1);
+            if (this._pitch === 0) {
+                // —— 正交快速路径（无俯仰）——
+                const upp = this.worldUnitsPerPixel();
+                const halfW = (this._viewportW / 2) * upp;
+                const halfH = (this._viewportH / 2) * upp;
+                const left = this._center.x - halfW;
+                const right = this._center.x + halfW;
+                const bottom = this._center.y + halfH;
+                const top = this._center.y - halfH;
+                mat4.ortho(this._viewProj, left, right, bottom, top, -1, 1);
 
-            if (this._bearing !== 0) {
-                const rot = mat4.create();
-                mat4.translate(rot, rot, [this._center.x, this._center.y, 0]);
-                mat4.rotateZ(rot, rot, this._bearing);
-                mat4.translate(rot, rot, [-this._center.x, -this._center.y, 0]);
-                mat4.multiply(this._viewProj, this._viewProj, rot);
+                if (this._bearing !== 0) {
+                    const rot = mat4.create();
+                    mat4.translate(rot, rot, [this._center.x, this._center.y, 0]);
+                    mat4.rotateZ(rot, rot, this._bearing);
+                    mat4.translate(rot, rot, [-this._center.x, -this._center.y, 0]);
+                    mat4.multiply(this._viewProj, this._viewProj, rot);
+                }
+            } else {
+                // —— 透视倾斜路径（俯仰 + 方位）——
+                this._buildMercatorPerspective(this._viewProj);
             }
         } else {
             // globe：投影 × 视图 × 模型旋转
             const aspect = this._viewportW / this._viewportH;
             const d = this.getGlobeDistance();
             const fov = this.getGlobeFovY();
-            // 深度范围：贴近球面时 surfaceDist 可能极小，near 需按之按例缩小
-            const surfaceDist = Math.max(1e-5, d - 1);
-            const near = Math.max(1e-4, surfaceDist * 0.5);
-            const far = d + 2;
-            const proj = mat4.create();
-            mat4.perspective(proj, fov, aspect, near, far);
 
+            // —— 视图矩阵 —— 
+            // 焦点 = 球面正对点 (0,0,1)（模型旋转已把 center 经纬度转到该处）。
             const view = mat4.create();
-            mat4.lookAt(view,
-                vec3.fromValues(0, 0, d),
-                vec3.fromValues(0, 0, 0),
-                vec3.fromValues(0, 1, 0));
+            const sp = Math.sin(this._pitch);
+            const cp = Math.cos(this._pitch);
+            const r = d - 1;                       // 相机到焦点的距离
+            // pitch=0 时 eye=(0,0,d)；pitch>0 时相机绕焦点 (0,0,1) 轨道旋转，
+            // 始终 lookAt 焦点 → 焦点恒居屏幕中心，地球不会偏出画面。
+            const eye = this._pitch === 0
+                ? vec3.fromValues(0, 0, d)
+                : vec3.fromValues(0, -r * sp, 1 + r * cp);
+            const up = this._pitch === 0
+                ? vec3.fromValues(0, 1, 0)
+                : vec3.fromValues(0, cp, sp);
+            const target = this._pitch === 0
+                ? vec3.fromValues(0, 0, 0)
+                : vec3.fromValues(0, 0, 1);
+            mat4.lookAt(view, eye, target, up);
 
-            if (this._pitch !== 0) {
-                const pitchMat = mat4.create();
-                mat4.rotateX(pitchMat, pitchMat, -this._pitch);
-                mat4.multiply(view, pitchMat, view);
-            }
             if (this._bearing !== 0) {
                 const bear = mat4.create();
                 mat4.rotateZ(bear, bear, this._bearing);
                 mat4.multiply(view, bear, view);
             }
+
+            // —— 投影矩阵 —— 依据相机到球心的实际距离设置 near/far
+            const eyeDist = this._pitch === 0
+                ? d
+                : Math.sqrt(r * r + 1 + 2 * r * cp);
+            const surfaceDist = Math.max(1e-5, eyeDist - 1);
+            const near = Math.max(1e-4, surfaceDist * 0.5);
+            const far = eyeDist + 2;
+            const proj = mat4.create();
+            mat4.perspective(proj, fov, aspect, near, far);
 
             const ll = this.getCenter();
             const lngRad = (ll.lng * Math.PI) / 180;

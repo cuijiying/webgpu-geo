@@ -252,3 +252,125 @@ if (this._inflight.size > 0) {
 - **GPU 纹理上传节流**：每帧限制 `_uploadToGPU` 次数，平滑突发上传带来的微卡顿。
 - **子级回退（down-sampling）**：缩小瞬间用已加载的高清子瓦片临时填充，提升过渡清晰度（注意层级差过大时子瓦片数量爆炸，需限制 1~2 级）。
 - **瓦片淡入 cross-fade 调优**：在层级切换时对新旧层做交叉淡化，进一步消除视觉跳变。
+
+---
+
+## 8. 倾斜视角（pitch / bearing）瓦片选择
+
+### 8.1 问题现象
+
+开启俯仰（pitch > 0）或旋转方位角（bearing ≠ 0）后，**远处（靠近地平线方向）的地图瓦片缺失**，视野上半部分出现空白；旋转时四角也会漏裁。
+
+### 8.2 根因
+
+平面模式原先用 `Camera.getVisibleWorldBounds()` 求一个**轴对齐的正交包围盒**来挑瓦片。该包围盒只在「正射俯视（pitch=0、bearing=0）」时与真实视野一致：
+
+- **pitch > 0**：透视投影下可视区域是一个**向远处张开的梯形**，一直延伸到地平线。轴对齐盒子按视口高度估算范围，远端瓦片根本不会被请求 → 远处空白。
+- **bearing ≠ 0**：可视矩形被旋转，轴对齐盒子无法覆盖旋转后的四角 → 边角漏裁。
+
+球体模式的 `_getGlobeVisibleTiles` 同理：可视球冠半角只由 FOV 推算，未计入 pitch，俯仰后地平线方向的球冠被低估 → 远处瓦片缺失。
+
+### 8.3 修复方案
+
+**平面（mercator）倾斜/旋转：屏幕空间采样 + 逐瓦片 LOD**
+
+当 `pitch ≠ 0 || bearing ≠ 0` 时，改用 `TilePyramid.getVisibleTilesTilted(camera, minZoom, maxZoom, dpr)`：
+
+1. 在屏幕（CSS 像素）上以固定步长（约 64px）撒网格采样点；
+2. 每个采样点用 `camera.unprojectToWorld` 做**射线-地面（z=0）求交**，落到世界坐标。地平线以上的点（射线 `t<0`）直接跳过，天然避免无穷大范围；
+3. 用采样点与其邻域像素（+δ）的世界距离估算**该处的每像素世界尺度**，反推**局部所需层级**
+
+   $$z_{\text{local}} = \log_2\!\left(\frac{\text{dpr}}{256 \cdot \text{worldPerCssPx}}\right)$$
+
+   近处（视野底部）≈ 相机层级，远处（地平线方向）尺度被透视拉大 → 层级自动降低；
+4. 把采样点所在瓦片按 `z_local` 收集去重。
+
+这样**梯形视野铺满到地平线**，同时远处用低层级瓦片，瓦片总数被采样点数量上界约束（与视口面积成正比，约百级），不会随 pitch 爆炸。非倾斜的正北俯视仍走原有 `getVisibleTiles` 快路径，行为不变。
+
+**球体（globe）俯仰：可视球冠按 pitch 外扩（限幅）+ 数量上限**
+
+`_getGlobeVisibleTiles` 的可视半角叠加**限幅后的** pitch：
+
+```ts
+// 直接叠加完整 pitch 会让可视半角剧增、瓦片数量爆炸，
+// 右键连续改变 pitch 时引发请求风暴导致卡死，因此必须限幅。
+const pitchPad = Math.min(camera.getPitch() * 0.5, 0.25);
+const visAng = Math.min(Math.PI, Math.max(visAngV, visAngH) + pitchPad + 1.5 * tileAngRadius);
+```
+
+并对一帧请求的 ideal 瓦片数设**硬上限**（按到视图中心的球面距离「近的优先」截断），作为兜底防止任何情况下的请求风暴：
+
+```ts
+const MAX_GLOBE_TILES = 200;
+if (cand.length > MAX_GLOBE_TILES) {
+    cand.sort((a, b) => b.cosD - a.cosD); // cosD 越大越近
+    cand.length = MAX_GLOBE_TILES;
+}
+```
+
+**球体俯仰的视角修正（相机绕焦点轨道旋转）**
+
+早期实现把俯仰写成 `pitchMat * view`（绕相机自身旋转），导致地球中心被甩出画面、视角错乱。正确做法是让相机**绕焦点（球面正对点 `(0,0,1)`）做轨道旋转**，焦点恒居屏幕中心：
+
+```ts
+const r = d - 1;                 // 相机到焦点的距离
+const eye = pitch === 0 ? [0,0,d] : [0, -r*sin(pitch), 1 + r*cos(pitch)];
+const up  = pitch === 0 ? [0,1,0] : [0, cos(pitch), sin(pitch)];
+const target = pitch === 0 ? [0,0,0] : [0,0,1];
+mat4.lookAt(view, eye, target, up);
+// near/far 依据俯仰后的实际相机距球心距离 eyeDist=√(r²+1+2r·cos(pitch)) 计算
+```
+
+### 8.4 修改文件
+
+| 文件 | 修改要点 |
+| --- | --- |
+| `src/tile/TilePyramid.ts` | 新增 `getVisibleTilesTilted`：屏幕空间采样 + 射线落地 + 逐采样点 LOD + 去重 |
+| `src/camera/Camera.ts` | globe 俯仰改为相机绕焦点 `(0,0,1)` 轨道旋转（焦点居中），near/far 按俯仰后实际相机距离计算 |
+| `src/layers/RasterTileLayer.ts` | 平面 `pitch≠0 \|\| bearing≠0` 时改用 `getVisibleTilesTilted`；globe 可视半角叠加**限幅** pitch（≤0.25）+ ideal 瓦片数硬上限 200（近距优先截断）防卡死 |
+
+### 8.5 验证
+
+打开 `debug/events.html`：
+
+- **2D 俯仰**：右键上下拖拽抬高俯仰角（或「俯仰 +15°」按钮到 60°），视野梯形应**铺满到地平线**，上半部分无空白。
+- **2D 旋转**：右键左右拖拽改变方位角，旋转后的四角应被瓦片完整覆盖。
+- **3D 俯仰**：切到「3D 球体」后抬高俯仰角，焦点应**始终居中**（地球不偏出画面），地平线方向瓦片正常加载，球面无大块空白。
+- **3D 右键拖拽不卡死**：在球体上右键连续拖拽改变俯仰/方位角，主线程应保持流畅，不再因瓦片请求风暴卡死。
+
+## 9. 球体大俯仰角下的画质问题（锯齿 + 底部遮挡）
+
+### 9.1 问题现象
+
+3D 球体模式下右键抬高俯仰角后：
+
+1. **远处切片锯齿化严重**：靠近地平线的瓦片被极度缩小，纹理闪烁/摩尔纹明显。
+2. **底部切片被遮挡**：画面下方中央出现一块带尖锐直边的三角形「空洞」，露出低清底图。
+
+### 9.2 根因
+
+1. **锯齿**：瓦片纹理只上传了 mip level 0，且采样器 `mipmapFilter:'nearest'`。掠射角下一个瓦片在屏幕上仅占几个像素，单层纹理点采样必然走样。
+2. **三角形空洞**：渲染管线启用了 `depthWriteEnabled:true` + `depthCompare:'less-equal'` 做瓦片间深度遮挡。但球面是用 `32×32` 镶嵌网格的**平面三角形近似**——不同覆盖范围 / 不同细分级别的瓦片（如兜底底图 vs ideal 瓦片）对同一球面的逼近误差不同，较粗的网格三角形会**凸出**到较细瓦片之前，在掠射角下沿网格三角形对角线发生 z-fighting，表现为带直边的三角形空洞。
+
+### 9.3 修复方案
+
+1. **Mipmap + 三线性 / 各向异性过滤**（解决锯齿）：
+   - 主采样器改为 `magFilter/minFilter/mipmapFilter = linear`，`maxAnisotropy:16`。
+   - 每张瓦片纹理按 `mipLevelCount = floor(log2(size))+1` 创建，上传 level 0 后用一条轻量「全屏三角形降采样」管线（`_ensureMipPipeline` / `_generateMips`）逐级 render 生成完整 mip 链（WebGPU 无内置 `generateMipmap`）。
+
+2. **改用绘制顺序合成，关闭瓦片间深度测试**（解决三角形空洞）：
+   - 远侧半球已由 `cullMode:'back'` 背面剔除；前侧半球瓦片在球面上互不重叠，无需深度缓冲做相互遮挡。
+   - 管线改为 `depthWriteEnabled:false` + `depthCompare:'always'`，按「先粗兜底、后 ideal」的绘制顺序合成，彻底消除球面近似误差导致的 z-fighting。
+
+### 9.4 修改文件
+
+| 文件 | 修改要点 |
+| --- | --- |
+| `src/layers/RasterTileLayer.ts` | 主采样器改三线性 + `maxAnisotropy:16`；瓦片纹理生成完整 mip 链（新增 `_ensureMipPipeline` / `_generateMips`）；渲染管线深度状态改为 `depthWrite:false` + `depthCompare:'always'`，依赖背面剔除 + 绘制顺序合成 |
+
+### 9.5 验证
+
+打开 `debug/events.html` → 「3D 球体」，抬高俯仰角到 50°~60°：
+
+- **远处不锯齿**：地平线方向被缩小的瓦片应平滑过渡，无闪烁/摩尔纹。
+- **底部无空洞**：画面下方应被瓦片完整覆盖，不再出现带直边的三角形低清块。

@@ -8,8 +8,12 @@ import {
     FILL_FLOATS, LINE_FLOATS, CIRCLE_FLOATS,
     type Mesh,
 } from '../geojson/geometry';
-import type { ColorLike, Feature, GeoJSONData, PaintValue } from '../geojson/types';
+import type { ColorLike, Feature, GeoJSONData, Geometry, PaintValue, Position } from '../geojson/types';
 import { FILL_WGSL, LINE_WGSL, CIRCLE_WGSL } from '../shaders/geojson.wgsl.ts';
+import type { Camera } from '../camera/Camera';
+import type { PixelXY } from '../geo/types';
+import { Mercator } from '../geo/Mercator';
+import { pointInScreenRing, distToPolyline } from '../control/hitTest';
 
 /**
  * GeoJSONLayer 样式（Mapbox paint 风格的精简集合）
@@ -40,6 +44,8 @@ export interface GeoJSONPaint {
 }
 
 export interface GeoJSONLayerOptions {
+    /** 图层 id（省略则自动生成） */
+    id?: string;
     /** 数据：FeatureCollection / Feature / Geometry / 远程 URL */
     data: GeoJSONData;
     /** 样式 */
@@ -125,7 +131,7 @@ export class GeoJSONLayer extends Layer {
     private _ready = false;
 
     constructor(opts: GeoJSONLayerOptions) {
-        super();
+        super(opts.id);
         this._paint = opts.paint ?? {};
         this._source = new GeoJSONSource(opts.data);
     }
@@ -280,6 +286,117 @@ export class GeoJSONLayer extends Layer {
         this._paint = { ...this._paint, ...paint };
         if (this.engine && this._source.loaded) this._build();
         return this;
+    }
+
+    /** 数据源（只读访问规范化后的 Feature 列表） */
+    get source(): GeoJSONSource { return this._source; }
+
+    // ====================== 命中测试（屏幕空间拾取） ======================
+
+    /**
+     * 拾取屏幕坐标下命中的要素。统一在屏幕 CSS 像素空间判定：
+     *   - Polygon ：投影外环/洞为屏幕多边形，射线法判断内部（再排除落在洞内的情况）
+     *   - LineString：点到折线最近距离 ≤ 线宽/2 + 容差
+     *   - Point   ：点到圆心距离 ≤ 圆半径 + 描边宽 + 容差
+     *
+     * globe 模式下自动跳过背面（不可见半球）的顶点。返回顺序：后绘制的在前（顶层优先）。
+     */
+    hitTest(point: PixelXY, camera: Camera, dpr: number, tolerance: number): Feature[] {
+        if (!this.visible || !this.interactive || !this._source.loaded) return [];
+        const hits: Feature[] = [];
+        const px = point.x;
+        const py = point.y;
+
+        for (const feature of this._source.features) {
+            const geom = feature.geometry;
+            if (!geom) continue;
+            if (this._geometryHit(geom, feature, px, py, camera, dpr, tolerance)) {
+                hits.push(feature);
+            }
+        }
+        // 后添加（绘制在上层）的要素优先返回
+        return hits.reverse();
+    }
+
+    private _geometryHit(
+        geom: Geometry, feature: Feature,
+        px: number, py: number,
+        camera: Camera, dpr: number, tol: number,
+    ): boolean {
+        switch (geom.type) {
+            case 'Point':
+                return this._pointHit(geom.coordinates, feature, px, py, camera, dpr, tol);
+            case 'MultiPoint':
+                return geom.coordinates.some((c) => this._pointHit(c, feature, px, py, camera, dpr, tol));
+            case 'LineString':
+                return this._lineHit(geom.coordinates, feature, px, py, camera, dpr, tol);
+            case 'MultiLineString':
+                return geom.coordinates.some((l) => this._lineHit(l, feature, px, py, camera, dpr, tol));
+            case 'Polygon':
+                return this._polygonHit(geom.coordinates, px, py, camera, dpr);
+            case 'MultiPolygon':
+                return geom.coordinates.some((p) => this._polygonHit(p, px, py, camera, dpr));
+            case 'GeometryCollection':
+                return geom.geometries.some((g) => this._geometryHit(g, feature, px, py, camera, dpr, tol));
+            default:
+                return false;
+        }
+    }
+
+    /** 经纬度坐标 → 屏幕 CSS 像素（含可见性） */
+    private _project(coord: Position, camera: Camera, dpr: number) {
+        const w = Mercator.lngLatToWorld({ lng: coord[0], lat: coord[1] });
+        return camera.projectWorld(w.x, w.y, dpr);
+    }
+
+    private _pointHit(
+        coord: Position, feature: Feature,
+        px: number, py: number,
+        camera: Camera, dpr: number, tol: number,
+    ): boolean {
+        const s = this._project(coord, camera, dpr);
+        if (!s.visible) return false;
+        const radius = resolveNumber(this._paint.circleRadius, feature, DEFAULT_PAINT.circleRadius);
+        const stroke = resolveNumber(this._paint.circleStrokeWidth, feature, DEFAULT_PAINT.circleStrokeWidth);
+        const r = radius + stroke + tol;
+        const dx = px - s.x;
+        const dy = py - s.y;
+        return dx * dx + dy * dy <= r * r;
+    }
+
+    private _lineHit(
+        coords: Position[], feature: Feature,
+        px: number, py: number,
+        camera: Camera, dpr: number, tol: number,
+    ): boolean {
+        const flat = this._projectRing(coords, camera, dpr);
+        if (flat.length < 2) return false;
+        const width = resolveNumber(this._paint.lineWidth, feature, DEFAULT_PAINT.lineWidth);
+        const threshold = width / 2 + tol;
+        return distToPolyline(px, py, flat) <= threshold;
+    }
+
+    private _polygonHit(rings: Position[][], px: number, py: number, camera: Camera, dpr: number): boolean {
+        if (rings.length === 0) return false;
+        const outer = this._projectRing(rings[0], camera, dpr);
+        if (outer.length < 6 || !pointInScreenRing(px, py, outer)) return false;
+        // 命中外环后，若落在任一洞内则不算命中
+        for (let i = 1; i < rings.length; i++) {
+            const hole = this._projectRing(rings[i], camera, dpr);
+            if (hole.length >= 6 && pointInScreenRing(px, py, hole)) return false;
+        }
+        return true;
+    }
+
+    /** 投影一个坐标环到扁平屏幕坐标数组，跳过 globe 背面点 */
+    private _projectRing(coords: Position[], camera: Camera, dpr: number): number[] {
+        const out: number[] = [];
+        for (const c of coords) {
+            const s = this._project(c, camera, dpr);
+            if (!s.visible || Number.isNaN(s.x)) continue;
+            out.push(s.x, s.y);
+        }
+        return out;
     }
 
     private async _loadAndBuild(): Promise<void> {

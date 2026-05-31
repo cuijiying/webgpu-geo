@@ -14,6 +14,8 @@ import { RASTER_TILE_WGSL } from '../shaders/raster.wgsl.ts';
  * 栅格瓦片图层配置
  */
 export interface RasterTileLayerOptions {
+    /** 图层 id（省略则自动生成） */
+    id?: string;
     source: TileSource;
     /** LRU 缓存容量（瓦片个数），默认 512 */
     cacheSize?: number;
@@ -135,6 +137,10 @@ export class RasterTileLayer extends Layer {
     private _globalUbo!: GPUBuffer;
     private _globalBindGroup!: GPUBindGroup;
     private _tileBindGroupLayout!: GPUBindGroupLayout;
+    // mipmap 生成（消除倾斜/远处瓦片的缩小走样）
+    private _mipPipeline?: GPURenderPipeline;
+    private _mipSampler?: GPUSampler;
+    private _mipBgl?: GPUBindGroupLayout;
     private _tileUbo!: GPUBuffer;
     private _tileUboCapacity = 0;
     private _scratch = new Float32Array(8);
@@ -151,7 +157,8 @@ export class RasterTileLayer extends Layer {
     private _inflight = new Set<Tile>();
 
     constructor(opts: RasterTileLayerOptions) {
-        super();
+        super(opts.id);
+        this.interactive = false; // 栅格瓦片图层默认不参与矢量拾取
         this._source = opts.source;
         this._cache = new TileCache(opts.cacheSize ?? 512);
         this._loader = new TileLoader(this._source, {
@@ -185,14 +192,16 @@ export class RasterTileLayer extends Layer {
         });
         device.queue.writeBuffer(this._indexBuffer, 0, QUAD_INDICES);
 
-        // 采样器：双线性，clamp 防止跨瓦片串色
+        // 采样器：三线性（带 mipmap），clamp 防止跨瓦片串色。
+        // mipmapFilter=linear 配合每张瓦片生成的 mip 链，消除球体倾斜后
+        // 远处/掠射角瓦片的缩小走样（锯齿、闪烁）。
         this._sampler = device.createSampler({
             magFilter: 'linear',
             minFilter: 'linear',
-            // 暂未生成 mipmap；置 nearest 避免某些驱动在 minLOD 上的怪异行为
-            mipmapFilter: 'nearest',
+            mipmapFilter: 'linear',
             addressModeU: 'clamp-to-edge',
             addressModeV: 'clamp-to-edge',
+            maxAnisotropy: 16,
         });
 
         // 全局 UBO：viewProj mat4 + flags vec4 = 80 bytes
@@ -274,10 +283,14 @@ export class RasterTileLayer extends Layer {
             },
             depthStencil: {
                 format: 'depth24plus',
-                // 启用深度写入与测试：球体模式下让近面遮挡远面；
-                // 平面模式下所有瓦片同一 Z 平面，less-equal 允许正常覆写
-                depthWriteEnabled: true,
-                depthCompare: 'less-equal',
+                // 不依赖深度缓冲做瓦片间遮挡：
+                //  - 球体远侧半球已由 cullMode:'back' 背面剔除；
+                //  - 前侧半球的瓦片在球面上互不重叠，按绘制顺序合成即可。
+                // 若启用深度测试，相邻瓦片/不同细分级别的兜底瓦片会因球面三角
+                // 近似误差而发生 z-fighting，在掠射角（大 pitch）下表现为底部
+                // 出现带尖锐直边的三角形“空洞”。故关闭深度写入并恒为通过。
+                depthWriteEnabled: false,
+                depthCompare: 'always',
             },
             multisample: {
                 count: engine.sampleCount,
@@ -318,7 +331,12 @@ export class RasterTileLayer extends Layer {
         // 2) 计算可见 ideal 瓦片
         const idealCoords = isGlobe
             ? this._getGlobeVisibleTiles(camera)
-            : TilePyramid.getVisibleTiles(camera, this._source.minZoom, this._source.maxZoom);
+            : (camera.getPitch() !== 0 || camera.getBearing() !== 0)
+                // 倾斜/旋转：屏幕空间采样 + 逐瓦片 LOD，铺满梯形视野到地平线
+                ? TilePyramid.getVisibleTilesTilted(
+                    camera, this._source.minZoom, this._source.maxZoom,
+                    window.devicePixelRatio || 1)
+                : TilePyramid.getVisibleTiles(camera, this._source.minZoom, this._source.maxZoom);
         if (idealCoords.length === 0) return;
 
         // 3) 对 ideal 瓦片发起请求；同时 prefetch 父级
@@ -563,9 +581,16 @@ export class RasterTileLayer extends Layer {
         };
         const visAngV = visAngFor(halfFovV);
         const visAngH = visAngFor(halfFovH);
-        // 取较大者作为外接圆半径，再加一个瓦片角半径的 padding 防边缘漏裁
+        // 取较大者作为外接圆半径，再加一个瓦片角半径的 padding 防边缘漏裁。
+        // 俯仰（pitch）会让视线偏向地平线，可视球冠需沿俯仰方向略微外扩；
+        // 但必须**限幅**——直接叠加完整 pitch 会让可视半角剧增、瓦片数量爆炸，
+        // 在右键拖动连续改变 pitch 时引发请求风暴导致卡死。
         const tileAngRadius = (Math.SQRT2 * Math.PI) / n;
-        const visAng = Math.min(Math.PI, Math.max(visAngV, visAngH) + 1.5 * tileAngRadius);
+        const pitchPad = Math.min(camera.getPitch() * 0.5, 0.25);
+        const visAng = Math.min(
+            Math.PI,
+            Math.max(visAngV, visAngH) + pitchPad + 1.5 * tileAngRadius,
+        );
 
         const tilesPerRad = n / (2 * Math.PI);
         const tileRadius = Math.min(n, Math.ceil(visAng * tilesPerRad) + 1);
@@ -585,6 +610,9 @@ export class RasterTileLayer extends Layer {
 
         const out: TileCoord[] = [];
         const seen = new Set<number>();
+        // 记录每个候选瓦片到 view center 的球面距离（cosD 越大越近），
+        // 超出预算时按"近的优先"截断，避免一次性请求过多瓦片造成卡死。
+        const cand: { x: number; y: number; cosD: number }[] = [];
         for (let y = minY; y <= maxY; y++) {
             for (let dx = -tileRadius; dx <= tileRadius; dx++) {
                 const rawX = cx + dx;
@@ -604,10 +632,17 @@ export class RasterTileLayer extends Layer {
                     sinCL * Math.sin(lat) +
                     cosCL * Math.cos(lat) * Math.cos(lng - centerLng);
                 if (cosD >= cosVis) {
-                    out.push({ z: targetZ, x, y });
+                    cand.push({ x, y, cosD });
                 }
             }
         }
+        // 预算上限：球体一帧最多请求的 ideal 瓦片数，超出按近距优先截断。
+        const MAX_GLOBE_TILES = 200;
+        if (cand.length > MAX_GLOBE_TILES) {
+            cand.sort((a, b) => b.cosD - a.cosD);
+            cand.length = MAX_GLOBE_TILES;
+        }
+        for (const c of cand) out.push({ z: targetZ, x: c.x, y: c.y });
         return out;
     }
 
@@ -655,10 +690,13 @@ export class RasterTileLayer extends Layer {
         if (tile.state !== TileState.Loaded || !tile.image) return;
         const device = this.engine.device;
         const size = this._source.tileSize;
+        // mip 链层级数：256 → 9 级。三线性采样需要完整 mip 链才能消除缩小走样。
+        const mipLevelCount = Math.floor(Math.log2(size)) + 1;
         const texture = device.createTexture({
             label: `tile-tex-${tile.key}`,
             size: { width: size, height: size },
             format: 'rgba8unorm',
+            mipLevelCount,
             usage:
                 GPUTextureUsage.TEXTURE_BINDING |
                 GPUTextureUsage.COPY_DST |
@@ -669,6 +707,8 @@ export class RasterTileLayer extends Layer {
             { texture, premultipliedAlpha: true },
             { width: size, height: size },
         );
+        // 逐级下采样生成 mipmap（WebGPU 无内置 generateMipmap）
+        this._generateMips(texture, mipLevelCount);
         tile.texture = texture;
         tile.image.close?.();
         tile.image = null;
@@ -684,6 +724,86 @@ export class RasterTileLayer extends Layer {
         });
         tile.state = TileState.Ready;
         (tile as Tile & { _readyAt?: number })._readyAt = performance.now();
+    }
+
+    /** 惰性创建 mipmap 下采样所用的渲染管线 / 采样器 */
+    private _ensureMipPipeline(): void {
+        if (this._mipPipeline) return;
+        const device = this.engine.device;
+        const module = device.createShaderModule({
+            label: 'mipgen-shader',
+            code: /* wgsl */ `
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn v(@builtin(vertex_index) i: u32) -> VOut {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
+    var o: VOut;
+    let xy = p[i];
+    o.pos = vec4<f32>(xy, 0.0, 1.0);
+    o.uv = xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+    return o;
+}
+@group(0) @binding(0) var s: sampler;
+@group(0) @binding(1) var t: texture_2d<f32>;
+@fragment fn f(o: VOut) -> @location(0) vec4<f32> {
+    return textureSample(t, s, o.uv);
+}`,
+        });
+        this._mipBgl = device.createBindGroupLayout({
+            label: 'mipgen-bgl',
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+            ],
+        });
+        this._mipSampler = device.createSampler({
+            magFilter: 'linear',
+            minFilter: 'linear',
+            mipmapFilter: 'nearest',
+            addressModeU: 'clamp-to-edge',
+            addressModeV: 'clamp-to-edge',
+        });
+        this._mipPipeline = device.createRenderPipeline({
+            label: 'mipgen-pipeline',
+            layout: device.createPipelineLayout({ bindGroupLayouts: [this._mipBgl] }),
+            vertex: { module, entryPoint: 'v' },
+            fragment: { module, entryPoint: 'f', targets: [{ format: 'rgba8unorm' }] },
+            primitive: { topology: 'triangle-list' },
+        });
+    }
+
+    /**
+     * 逐级把 mip(i-1) 下采样渲染到 mip(i)，生成完整 mip 链。
+     * 用全屏三角形 + 线性采样实现 2×2 box 平均（已是 premultiplied alpha，线性平均正确）。
+     */
+    private _generateMips(texture: GPUTexture, mipLevelCount: number): void {
+        if (mipLevelCount <= 1) return;
+        this._ensureMipPipeline();
+        const device = this.engine.device;
+        const encoder = device.createCommandEncoder({ label: 'mipgen' });
+        for (let i = 1; i < mipLevelCount; i++) {
+            const srcView = texture.createView({ baseMipLevel: i - 1, mipLevelCount: 1 });
+            const dstView = texture.createView({ baseMipLevel: i, mipLevelCount: 1 });
+            const bg = device.createBindGroup({
+                layout: this._mipBgl!,
+                entries: [
+                    { binding: 0, resource: this._mipSampler! },
+                    { binding: 1, resource: srcView },
+                ],
+            });
+            const pass = encoder.beginRenderPass({
+                colorAttachments: [{
+                    view: dstView,
+                    loadOp: 'clear',
+                    storeOp: 'store',
+                    clearValue: { r: 0, g: 0, b: 0, a: 0 },
+                }],
+            });
+            pass.setPipeline(this._mipPipeline!);
+            pass.setBindGroup(0, bg);
+            pass.draw(3);
+            pass.end();
+        }
+        device.queue.submit([encoder.finish()]);
     }
 
     /** 扩容每瓦片 UBO（容量不够时），并重建所有已存在 tile 的 bindGroup */
