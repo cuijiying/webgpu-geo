@@ -3,6 +3,7 @@ import { Renderer } from './core/Renderer';
 import { Camera, type ProjectionMode } from './camera/Camera';
 import { Layer } from './layers/Layer';
 import { RasterTileLayer } from './layers/RasterTileLayer';
+import { GeoJSONLayer, type GeoJSONLayerOptions } from './layers/GeoJSONLayer';
 import { TileSource } from './tile/TileSource';
 import { MapInteraction } from './control/MapInteraction';
 import type { LngLat } from './geo/types';
@@ -105,6 +106,16 @@ export class Map {
 
     addLayer(layer: Layer): this { this.renderer.addLayer(layer); return this; }
     removeLayer(layer: Layer): this { this.renderer.removeLayer(layer); return this; }
+
+    /**
+     * 便捷添加 GeoJSON 矢量图层（点/线/面）。
+     * 返回创建的 GeoJSONLayer，可用其 setData / setPaint 动态更新。
+     */
+    addGeoJSON(opts: GeoJSONLayerOptions): GeoJSONLayer {
+        const layer = new GeoJSONLayer(opts);
+        this.renderer.addLayer(layer);
+        return layer;
+    }
 
     setCenter(lngLat: LngLat): this { this.camera.setCenter(lngLat); return this; }
     getCenter(): LngLat { return this.camera.getCenter(); }

@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>webgpu-geo · GeoJSON 矢量测试</title>
+    <style>
+        html, body { margin: 0; padding: 0; height: 100%; background: #0c1014; overflow: hidden; }
+        #map { width: 100%; height: 100%; display: block; }
+        .hud {
+            position: absolute; top: 10px; left: 10px;
+            background: rgba(0,0,0,.65); color: #fff;
+            padding: 12px 14px; border-radius: 8px;
+            font: 12px/1.6 -apple-system, "Segoe UI", sans-serif;
+            user-select: none; width: 230px;
+        }
+        .hud b { color: #6cf; }
+        .hud h3 { margin: 0 0 8px; font-size: 13px; color: #9fe; }
+        .hud .row { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+        .hud button {
+            cursor: pointer; border: 1px solid #345; background: #1a2530;
+            color: #cdf; border-radius: 5px; padding: 4px 8px; font-size: 12px;
+        }
+        .hud button:hover { background: #25323f; }
+        .hud label { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+        .hud input[type=checkbox] { accent-color: #3bb2d0; }
+        .info { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2a3a47; }
+    </style>
+</head>
+<body>
+    <canvas id="map"></canvas>
+    <div class="hud">
+        <h3>GeoJSON 矢量图层</h3>
+        <div>拖拽平移 · 滚轮缩放</div>
+        <div class="info">
+            center: <b id="center">-</b><br>
+            zoom: <b id="zoom">-</b> · proj: <b id="proj">-</b>
+        </div>
+        <div class="row">
+            <button id="btn-2d">2D 平面</button>
+            <button id="btn-3d">3D 球体</button>
+        </div>
+        <div class="info">
+            <label><input type="checkbox" id="tg-fill" checked> 面填充（省界示例）</label>
+            <label><input type="checkbox" id="tg-line" checked> 线（路径示例）</label>
+            <label><input type="checkbox" id="tg-point" checked> 点（城市示例）</label>
+        </div>
+        <div class="row">
+            <button id="btn-recolor">随机面色</button>
+            <button id="btn-fly">飞到中国</button>
+        </div>
+    </div>
+
+    <script>document.write('<script src="../dist/aimap-dev.umd.js?v=' + Date.now() + '"><\/script>');</script>
+    <script>
+    (async function () {
+        // ---------- 示例数据 ----------
+        // 面：两个简单多边形（其中一个带洞），用 properties.color 演示数据驱动样式
+        const polygons = {
+            type: 'FeatureCollection',
+            features: [
+                {
+                    type: 'Feature',
+                    properties: { color: '#f4a261' },
+                    geometry: {
+                        type: 'Polygon',
+                        coordinates: [[
+                            [100, 25], [115, 25], [115, 40], [100, 40], [100, 25]
+                        ], [
+                            // 洞
+                            [104, 29], [111, 29], [111, 36], [104, 36], [104, 29]
+                        ]]
+                    }
+                },
+                {
+                    type: 'Feature',
+                    properties: { color: '#2a9d8f' },
+                    geometry: {
+                        type: 'Polygon',
+                        coordinates: [[
+                            [118, 28], [128, 30], [126, 42], [116, 44], [118, 28]
+                        ]]
+                    }
+                }
+            ]
+        };
+
+        // 线：一条折线路径
+        const lines = {
+            type: 'FeatureCollection',
+            features: [{
+                type: 'Feature',
+                properties: { width: 3 },
+                geometry: {
+                    type: 'LineString',
+                    coordinates: [
+                        [90, 45], [100, 40], [110, 38], [116.4, 39.9],
+                        [121.5, 31.2], [113.3, 23.1], [104, 30.6]
+                    ]
+                }
+            }]
+        };
+
+        // 点：若干城市
+        const cities = {
+            type: 'FeatureCollection',
+            features: [
+                ['北京', 116.4074, 39.9042, '#e63946'],
+                ['上海', 121.4737, 31.2304, '#457b9d'],
+                ['广州', 113.2644, 23.1291, '#2a9d8f'],
+                ['成都', 104.0665, 30.5728, '#e9c46a'],
+                ['乌鲁木齐', 87.6168, 43.8256, '#9b5de5'],
+            ].map(function (c) {
+                return {
+                    type: 'Feature',
+                    properties: { name: c[0], color: c[3] },
+                    geometry: { type: 'Point', coordinates: [c[1], c[2]] }
+                };
+            })
+        };
+
+        // ---------- 创建地图 ----------
+        const map = new ai.Map({
+            container: 'map',
+            center: { lng: 110, lat: 34 },
+            zoom: 3,
+            minZoom: 0,
+            maxZoom: 19,
+            projection: 'mercator',
+            tileSource: {
+                url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                subdomains: ['a', 'b', 'c']
+            }
+        });
+        await map.ready();
+
+        // ---------- 添加矢量图层 ----------
+        const fillLayer = map.addGeoJSON({
+            data: polygons,
+            paint: {
+                fillColor: ['get', 'color'],   // 数据驱动：读取 properties.color
+                fillOpacity: 0.45,
+                fillOutlineColor: '#ffffff',
+                fillOutlineWidth: 1.5
+            }
+        });
+
+        const lineLayer = map.addGeoJSON({
+            data: lines,
+            paint: {
+                lineColor: '#ffd166',
+                lineWidth: ['get', 'width'],
+                lineOpacity: 0.95
+            }
+        });
+
+        const pointLayer = map.addGeoJSON({
+            data: cities,
+            paint: {
+                circleColor: ['get', 'color'],
+                circleRadius: 7,
+                circleStrokeColor: '#ffffff',
+                circleStrokeWidth: 2
+            }
+        });
+
+        // ---------- HUD ----------
+        const $c = document.getElementById('center');
+        const $z = document.getElementById('zoom');
+        const $p = document.getElementById('proj');
+        function updateHud() {
+            const c = map.getCenter();
+            $c.textContent = c.lng.toFixed(3) + ', ' + c.lat.toFixed(3);
+            $z.textContent = map.getZoom().toFixed(2);
+            $p.textContent = map.getProjection();
+        }
+        map.camera.onChange(updateHud);
+        updateHud();
+
+        document.getElementById('btn-2d').onclick = () => map.setProjection('mercator');
+        document.getElementById('btn-3d').onclick = () => map.setProjection('globe');
+
+        document.getElementById('tg-fill').onchange = (e) => { fillLayer.visible = e.target.checked; map.renderer.requestRender(); };
+        document.getElementById('tg-line').onchange = (e) => { lineLayer.visible = e.target.checked; map.renderer.requestRender(); };
+        document.getElementById('tg-point').onchange = (e) => { pointLayer.visible = e.target.checked; map.renderer.requestRender(); };
+
+        document.getElementById('btn-recolor').onclick = () => {
+            const rnd = () => '#' + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0');
+            fillLayer.setPaint({ fillColor: rnd() });
+        };
+        document.getElementById('btn-fly').onclick = () => {
+            map.setCenter({ lng: 110, lat: 34 });
+            map.setZoom(3);
+        };
+
+        window.map = map;
+    })().catch(function (err) {
+        document.body.innerHTML = '<div style="color:#fff;padding:24px;font-family:sans-serif">' +
+            '<h2>初始化失败</h2><pre>' + err.stack + '</pre></div>';
+    });
+    </script>
+</body>
+</html>
