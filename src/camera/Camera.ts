@@ -269,20 +269,27 @@ export class Camera {
         if (!inv) return null;
         const ndcX = (px * dpr) / this._viewportW * 2 - 1;
         const ndcY = 1 - (py * dpr) / this._viewportH * 2;
-        const near = vec4.transformMat4(vec4.create(), vec4.fromValues(ndcX, ndcY, 0, 1), inv);
+        // 高缩放时相机几乎贴在球面上（near≈2e-5），用近裁剪面逆投影得到的射线
+        // 起点 o 病态：微小误差会把 o 推到球内/对侧，导致求交命中背面、反算出
+        // 完全错误的世界坐标（瓦片选错→画面空洞/错铺）。改用「精确相机位置作起点 +
+        // 远点仅用于定向」：相机位置由 getGlobeEyeModel 在基础球面空间精确给出，
+        // 远裁剪面(≈3)逆投影良态，二者之差即为稳定的射线方向。
         const far = vec4.transformMat4(vec4.create(), vec4.fromValues(ndcX, ndcY, 1, 1), inv);
-        const o = vec3.fromValues(near[0] / near[3], near[1] / near[3], near[2] / near[3]);
         const f = vec3.fromValues(far[0] / far[3], far[1] / far[3], far[2] / far[3]);
+        const o = this.getGlobeEyeModel(vec3.create());
         const dir = vec3.sub(vec3.create(), f, o);
         vec3.normalize(dir, dir);
-        // |o + t·dir|² = 1
-        const b = 2 * vec3.dot(o, dir);
-        const c = vec3.dot(o, o) - 1;
-        const disc = b * b - 4 * c;
+        // |o + t·dir|² = 1，用垂距法求判别式：disc = 1 - |o - (o·dir)dir|²，
+        // 避免 |o|≈1 时 dot(o,o)-1 的抵消，并稳定取近交点。
+        const b = vec3.dot(o, dir);
+        const perpx = o[0] - b * dir[0];
+        const perpy = o[1] - b * dir[1];
+        const perpz = o[2] - b * dir[2];
+        const disc = 1 - (perpx * perpx + perpy * perpy + perpz * perpz);
         if (disc < 0) return null;
         const sqrt = Math.sqrt(disc);
-        const t = (-b - sqrt) / 2;
-        const tHit = t >= 0 ? t : (-b + sqrt) / 2;
+        const tNear = -b - sqrt;
+        const tHit = tNear >= 0 ? tNear : (-b + sqrt);
         if (tHit < 0) return null;
         const hit = vec3.scaleAndAdd(vec3.create(), o, dir, tHit);
         return Camera.sphereToWorld(hit[0], hit[1], hit[2]);
@@ -323,6 +330,33 @@ export class Camera {
     /** globe 模式实际使用的垂直 FOV（保持固定，避免光学缩放带来的瓦片分辨率失配） */
     getGlobeFovY(): number {
         return Camera.FOV_Y;
+    }
+
+    /**
+     * globe 模式下相机在「基础球面空间」（着色器顶点 p 所在空间，即 model 旋转之前）
+     * 中的位置。用于片元着色器按真实地平线做解析覆盖抗锯齿。
+     * 推导：clip = proj·view·model·p，相机在世界空间(W)的位置即 lookAt 的 eye；
+     * 而 p 属于基础球面空间(S)，model 把 S→W，故 eyeS = model⁻¹·eyeW。
+     * model 为纯旋转 → model⁻¹ = transpose(model)。
+     */
+    getGlobeEyeModel(out: vec3): vec3 {
+        const d = this.getGlobeDistance();
+        const r = d - 1;
+        const sp = Math.sin(this._pitch);
+        const cp = Math.cos(this._pitch);
+        // 相机在世界空间(W)的位置（bearing 仅改朝向不改位置）
+        const eyeW = this._pitch === 0
+            ? vec3.fromValues(0, 0, d)
+            : vec3.fromValues(0, -r * sp, 1 + r * cp);
+        // model = rotateX(lat)·rotateY(-lng)；其逆 = rotateY(lng)·rotateX(-lat)
+        const ll = this.getCenter();
+        const lngRad = (ll.lng * Math.PI) / 180;
+        const latRad = (ll.lat * Math.PI) / 180;
+        const inv = mat4.create();
+        mat4.rotateY(inv, inv, lngRad);
+        mat4.rotateX(inv, inv, -latRad);
+        vec3.transformMat4(out, eyeW, inv);
+        return out;
     }
 
     /** globe 模式下，屏幕 1 像素对应球面多少弧度 */
@@ -472,8 +506,13 @@ export class Camera {
             const eyeDist = this._pitch === 0
                 ? d
                 : Math.sqrt(r * r + 1 + 2 * r * cp);
-            const surfaceDist = Math.max(1e-5, eyeDist - 1);
-            const near = Math.max(1e-4, surfaceDist * 0.5);
+            const surfaceDist = Math.max(1e-7, eyeDist - 1);
+            // near 必须小于相机到最近地表点的距离(surfaceDist)，否则近处地表会被近裁剪面
+            // 整体裁掉。高缩放时 surfaceDist 极小（z14≈8.6e-5），固定下限(如 1e-4)会
+            // 超过 surfaceDist，导致俯视全黑、倾斜时近地（屏幕下方）被裁出「空洞」。
+            // 故 near 取 surfaceDist 的固定比例，仅用极小绝对下限兜底。
+            // （栅格瓦片 depthWrite 关闭、depthCompare=always，near 取小不会带来深度精度问题。）
+            const near = Math.max(1e-7, surfaceDist * 0.5);
             const far = eyeDist + 2;
             const proj = mat4.create();
             mat4.perspective(proj, fov, aspect, near, far);

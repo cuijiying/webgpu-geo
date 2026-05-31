@@ -62,7 +62,13 @@ export class TilePyramid {
         const STEP = 64;              // 采样步长（CSS 像素）
         const DELTA = 4;              // 估算局部尺度的邻域偏移（CSS 像素）
         const camZ = camera.getZoom();
-        const hiZ = Math.min(maxZoom, Math.round(camZ) + 1);
+        // hiZ（细节级上限）：
+        //   - mercator：camera.zoom 即瓦片层级语义，round(camZ)+1 足够；
+        //   - globe   ：camera.zoom 控制的是相机距离（d=1+(d0-1)/2^zoom），并非瓦片层级，
+        //               其数值远低于实际所需 z（如 zoom=4 实际需 z≈7）。此时完全交给
+        //               逐采样点的屏幕空间导数（wpp）推算 z，上限放宽到 maxZoom。
+        const isGlobe = camera.getProjection() === 'globe';
+        const hiZ = isGlobe ? maxZoom : Math.min(maxZoom, Math.round(camZ) + 1);
 
         const out: TileCoord[] = [];
         const seen = new Set<string>();

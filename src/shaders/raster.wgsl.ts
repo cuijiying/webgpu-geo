@@ -23,6 +23,8 @@ struct GlobalUniforms {
     viewProj: mat4x4<f32>,
     // x = projectionMode (0=mercator, 1=globe), yzw = 预留
     flags: vec4<f32>,
+    // globe 模式：相机在基础球面空间中的位置（xyz），w 预留。用于地平线解析抗锯齿。
+    eye: vec4<f32>,
 };
 
 struct TileUniforms {
@@ -36,8 +38,10 @@ struct TileUniforms {
 @group(1) @binding(2) var          uSamp   : sampler;
 
 struct VsOut {
-    @builtin(position) pos : vec4<f32>,
-    @location(0)       uv  : vec2<f32>,
+    @builtin(position) pos    : vec4<f32>,
+    @location(0)       uv     : vec2<f32>,
+    // globe 模式下顶点对应的单位球面坐标（mercator 下为 0）
+    @location(1)       sphere : vec3<f32>,
 };
 
 const PI : f32 = 3.14159265358979;
@@ -62,25 +66,49 @@ fn vs_main(@location(0) inUv : vec2<f32>) -> VsOut {
     let uvScl = uTile.uvOffsetScale.zw;
 
     var pos4 : vec4<f32>;
+    var sphere = vec3<f32>(0.0, 0.0, 0.0);
     if (uGlobal.flags.x > 0.5) {
         // globe
-        let p = mercator_to_sphere(world);
-        pos4 = vec4<f32>(p, 1.0);
+        sphere = mercator_to_sphere(world);
+        pos4 = vec4<f32>(sphere, 1.0);
     } else {
         // mercator
         pos4 = vec4<f32>(world, 0.0, 1.0);
     }
 
     var o : VsOut;
-    o.pos = uGlobal.viewProj * pos4;
-    o.uv  = uvOff + inUv * uvScl;
+    o.pos    = uGlobal.viewProj * pos4;
+    o.uv     = uvOff + inUv * uvScl;
+    o.sphere = sphere;
     return o;
 }
 
 @fragment
 fn fs_main(in : VsOut) -> @location(0) vec4<f32> {
     let c = textureSample(uTex, uSamp, in.uv);
-    let a = uTile.worldOffsetSize.w;
+    var a = uTile.worldOffsetSize.w;
+
+    // globe：按真实地平线做解析覆盖抗锯齿。
+    // 单位球(半径1)被距球心 |eye| 的相机观察时，可见地平线满足 dot(p, eye) = 1：
+    //   h > 0 → 近侧可见半球；h < 0 → 被地平线遮挡的背侧。
+    // 用屏幕空间导数 fwidth(h) 把硬边界软化为约 1 像素宽的解析边缘，
+    // 从而消除镶嵌三角形/背面剔除在球体轮廓处产生的锯齿（MSAA 无法覆盖的几何走样）。
+    if (uGlobal.flags.x > 0.5) {
+        // in.sphere 是逐片元插值得到的球面点，在三角形内部会沿弦收缩（|in.sphere|<1）。
+        // 高缩放时回退父级（大三角形）瓦片的收缩量(≈α²/8)远大于此时极小的地平线余量
+        // r=|eye|-1（z14 仅约 4.5e-5），若直接用 dot(in.sphere,eye)-1 会把可见的近侧
+        // 片元误判为背侧而整体丢弃，导致球体底部「空洞」。故先归一化方向；
+        // 并改用 dot(S, eye-S) 代替 dot(S,eye)-1，避免两个≈1的数相减带来的灾难性抵消。
+        let S = normalize(in.sphere);
+        let h = dot(S, uGlobal.eye.xyz - S);
+        let aa = clamp(h / fwidth(h) + 0.5, 0.0, 1.0);
+        // 越过地平线的背侧片元（aa≈0）直接丢弃，避免它们在掠射角下覆盖/擦除
+        // 前侧已绘制的瓦片，导致球体底部出现空洞。仍保留 (0,1] 的解析覆盖淡出，
+        // 使可见轮廓保持约 1 像素的平滑边缘。
+        if (aa <= 0.0) { discard; }
+        a = a * aa;
+    }
+
     return vec4<f32>(c.rgb * a, c.a * a);
 }
 `;

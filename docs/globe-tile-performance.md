@@ -327,6 +327,66 @@ mat4.lookAt(view, eye, target, up);
 | --- | --- |
 | `src/tile/TilePyramid.ts` | 新增 `getVisibleTilesTilted`：屏幕空间采样 + 射线落地 + 逐采样点 LOD + 去重 |
 | `src/camera/Camera.ts` | globe 俯仰改为相机绕焦点 `(0,0,1)` 轨道旋转（焦点居中），near/far 按俯仰后实际相机距离计算 |
+
+---
+
+## 13. 高缩放球体「底部空洞」根因：近裁剪面下限裁掉近地
+
+### 13.1 现象
+
+球体投影下，**缩放越高（z≈14）+ 俯仰越大（≈58°）**，画面**底部（近地一侧）越明显地变成大片空洞/深色**，仅顶部一条窄带有正常瓦片；甚至**正俯视（pitch=0）z14 时整屏全黑**。低/中缩放（z4、z12）完全正常。
+
+### 13.2 排查路径与两个被排除的「假根因」
+
+定位过程中先后修复了两个**确实存在、但不是本现象主因**的问题，记录以备参考：
+
+1. **着色器地平线丢弃精度（已修，§ raster.wgsl 横屏丢弃块）**：`in.sphere` 经透视插值后会沿弦收缩（`|in.sphere|<1`），高缩放时父级大三角形的收缩量（≈α²/8）远大于此时极小的地平线余量 `r=|eye|-1`（z14≈4.5e-5），导致 `dot(in.sphere,eye)-1` 对正面片元误判为负而整片 `discard`。修法：先 `S = normalize(in.sphere)` 消除弦收缩，再用 `h = dot(S, eye - S)` 避免 `dot(≈1)-1` 的灾难性相消。
+2. **unproject 数值不稳定（已修，`Camera.unprojectToWorld` globe 分支）**：z14 时 near≈2e-5，对 viewProj 求逆得到的近平面点 `o` 病态，落到球的远侧，反投影返回近对跖点的错误经纬度，污染 `getVisibleTilesTilted` 的选瓦。修法：射线**原点直接用精确的 `getGlobeEyeModel`（base 空间）**，方向由条件良好的远平面点给出，再用垂距判别式求交。
+
+> 经验：以上两修是真实 bug 且应保留，但修完后 z14 仍为「顶部窄带 + 底部深色」——说明主因另有其物。
+
+### 13.3 真正的根因：`near` 下限大于相机到地表的距离
+
+`getViewProjectionMatrix` 的 globe 分支原本：
+
+```ts
+const surfaceDist = Math.max(1e-5, eyeDist - 1); // 相机到最近地表点的距离
+const near = Math.max(1e-4, surfaceDist * 0.5);  // ← 固定下限 1e-4 是元凶
+```
+
+单位球下，z14 时相机离地表极近：`surfaceDist = eyeDist - 1 ≈ 8.6e-5`（≈地球等效 287 m）。固定下限 `1e-4` **大于** `surfaceDist`，于是**整个可见地表都落在近裁剪面之内被裁掉**：
+
+- **pitch=0（正俯视）**：最近地表点 `8.6e-5` < `near=1e-4`，整屏全黑。
+- **大俯仰**：屏幕**上方**（远地）距离 > `1e-4` 得以保留 → 顶部窄带；屏幕**下方**（近地）距离 < `1e-4` 被裁掉 → 底部空洞。这正是「底部空洞且层级越高越明显」的真容。
+- **低/中缩放**：`surfaceDist` 较大（z12≈3.4e-3），`near=surfaceDist*0.5` 主导，固定下限从不生效 → 一直正常，故此前难以察觉。
+
+### 13.4 修法
+
+near 必须**恒小于** `surfaceDist`，因此取 `surfaceDist` 的固定比例，仅以极小绝对值兜底防 0：
+
+```ts
+const surfaceDist = Math.max(1e-7, eyeDist - 1);
+const near = Math.max(1e-7, surfaceDist * 0.5); // 不再用 1e-4 这类会超过 surfaceDist 的固定下限
+const far  = eyeDist + 2;
+```
+
+> 栅格瓦片管线 `depthWrite=false`、`depthCompare=always`，near 取极小**不会**带来深度精度/z-fighting 问题，可放心下调。
+
+### 13.5 验证
+
+| 场景 | 结果 |
+| --- | --- |
+| z14 / pitch≈58° | 地表**铺满全屏**，底部空洞消失（z14 OSM 瓦片受网络限流 `ERR_ABORTED`，但几何已全覆盖） |
+| z14 / pitch=0 | 不再全黑，正常铺满 |
+| z12 / pitch≈45.8° | 全屏清晰街道，上下满覆盖，无回归 |
+| z4 / pitch=0 | 球面正常，无回归 |
+
+### 13.6 修改文件
+
+| 文件 | 修改要点 |
+| --- | --- |
+| `src/camera/Camera.ts` | `getViewProjectionMatrix` globe 分支：`near` 改为 `max(1e-7, surfaceDist*0.5)`，去掉会超过 `surfaceDist` 的固定下限 `1e-4`；`unprojectToWorld` globe 分支改用精确 eye 作射线原点 + 远点定向 + 垂距判别式 |
+| `src/shaders/raster.wgsl.ts` | fs_main 地平线丢弃改为 `normalize(in.sphere)` + `dot(S, eye-S)` 无相消判据 |
 | `src/layers/RasterTileLayer.ts` | 平面 `pitch≠0 \|\| bearing≠0` 时改用 `getVisibleTilesTilted`；globe 可视半角叠加**限幅** pitch（≤0.25）+ ideal 瓦片数硬上限 200（近距优先截断）防卡死 |
 
 ### 8.5 验证
@@ -359,14 +419,14 @@ mat4.lookAt(view, eye, target, up);
    - 每张瓦片纹理按 `mipLevelCount = floor(log2(size))+1` 创建，上传 level 0 后用一条轻量「全屏三角形降采样」管线（`_ensureMipPipeline` / `_generateMips`）逐级 render 生成完整 mip 链（WebGPU 无内置 `generateMipmap`）。
 
 2. **改用绘制顺序合成，关闭瓦片间深度测试**（解决三角形空洞）：
-   - 远侧半球已由 `cullMode:'back'` 背面剔除；前侧半球瓦片在球面上互不重叠，无需深度缓冲做相互遮挡。
+   - 球体瓦片选择集本就只包含可见半球（近侧球冠），远侧半球不在绘制列表中；前侧半球瓦片在球面上互不重叠，无需深度缓冲做相互遮挡。
    - 管线改为 `depthWriteEnabled:false` + `depthCompare:'always'`，按「先粗兜底、后 ideal」的绘制顺序合成，彻底消除球面近似误差导致的 z-fighting。
 
 ### 9.4 修改文件
 
 | 文件 | 修改要点 |
 | --- | --- |
-| `src/layers/RasterTileLayer.ts` | 主采样器改三线性 + `maxAnisotropy:16`；瓦片纹理生成完整 mip 链（新增 `_ensureMipPipeline` / `_generateMips`）；渲染管线深度状态改为 `depthWrite:false` + `depthCompare:'always'`，依赖背面剔除 + 绘制顺序合成 |
+| `src/layers/RasterTileLayer.ts` | 主采样器改三线性 + `maxAnisotropy:16`；瓦片纹理生成完整 mip 链（新增 `_ensureMipPipeline` / `_generateMips`）；渲染管线深度状态改为 `depthWrite:false` + `depthCompare:'always'`，按绘制顺序合成 |
 
 ### 9.5 验证
 
@@ -374,3 +434,121 @@ mat4.lookAt(view, eye, target, up);
 
 - **远处不锯齿**：地平线方向被缩小的瓦片应平滑过渡，无闪烁/摩尔纹。
 - **底部无空洞**：画面下方应被瓦片完整覆盖，不再出现带直边的三角形低清块。
+
+## 10. 球体轮廓（地平线）锯齿
+
+### 10.1 问题现象
+
+3D 球体模式下，地球**轮廓边缘**（limb / 天际线，瓦片与背景交界处）锯齿明显，MSAA 4× 也压不住。
+
+### 10.2 根因
+
+球面由 `32×32` 镶嵌的**平面三角形**拼出，轮廓由「正面三角形到此为止」的几何边界决定。在掠射角处这些三角形近乎侧立、退化为亚像素细条，MSAA 4× 无法对这种几何走样充分采样，于是轮廓呈现锯齿/闪烁。提高镶嵌密度也无法消除细条 sparkle。
+
+### 10.3 修复方案：地平线解析覆盖抗锯齿
+
+不再依赖几何边界与 MSAA 决定轮廓，而在**片元着色器里按真实球面地平线解析地计算覆盖率**：
+
+- 单位球（半径 1）被距球心 `|eye|` 的相机观察时，可见地平线满足 `dot(p, eye) = 1`（`p` 为基础球面空间顶点坐标，`eye` 为相机在该空间的位置）。令 `h = dot(p, eye) - 1`：`h>0` 为近侧可见、`h<0` 为越过地平线的背侧。
+- 用屏幕空间导数把硬边界软化为约 1 像素宽的解析边缘：`alpha *= clamp(h / fwidth(h) + 0.5, 0, 1)`。轮廓由平滑的 `h=0` 等值线决定，与镶嵌密度无关，锯齿消失。
+- 为让覆盖率能在「可绘制几何」内完整淡到 0，球体管线改 `cullMode:'none'`（横跨地平线的瓦片其越过地平线的三角形也需光栅化后由 alpha 淡出）；远侧半球本不在瓦片选择集中，故此改动几乎无额外开销。
+- 相机在基础球面空间的位置由 `Camera.getGlobeEyeModel()` 计算：相机世界坐标经 `model⁻¹`（纯旋转的转置）变换得到，每帧写入全局 UBO 新增的 `eye` 字段。
+
+### 10.4 修改文件
+
+| 文件 | 修改要点 |
+| --- | --- |
+| `src/shaders/raster.wgsl.ts` | `GlobalUniforms` 新增 `eye`；顶点输出球面坐标 `sphere`；片元按 `h=dot(sphere,eye)-1` 做 `fwidth` 解析覆盖淡出 |
+| `src/camera/Camera.ts` | 新增 `getGlobeEyeModel()`：返回相机在基础球面空间的位置（`model⁻¹·eyeW`） |
+| `src/layers/RasterTileLayer.ts` | 全局 UBO 扩到 96 字节并每帧写入 `eye`；球体管线 `cullMode` 由 `back` 改为 `none` |
+
+### 10.5 验证
+
+`debug/events.html` → 「3D 球体」：
+
+- **轮廓平滑**：缩小到可见整个地球时，地球边缘应为平滑圆弧，无三角面锯齿/闪烁。
+- **大俯仰地平线平滑**：抬高俯仰角到 55°，顶部地平线应为平滑曲线。
+- **无回归**：底部无三角形空洞、远处瓦片仍平滑。
+
+## 11. 球体远端「整片瓦片」阶梯状边界
+
+### 11.1 问题现象
+
+3D 球体模式下，在中等缩放（如 zoom 4）+ 较大俯仰角时，画面**远端 / 顶部**的瓦片覆盖边界与黑色背景之间出现明显的**整片瓦片阶梯**（whole-tile staircase）——瓦片没有铺到真正的地平线就「断」了，留下几级瓦片大小的台阶。第 10 节的地平线解析覆盖只在真实地平线 `h=0` 处淡出，对「瓦片在 `h>0` 处就提前结束」的硬边界无能为力。
+
+### 11.2 根因
+
+旧的 `_getGlobeVisibleTiles` 对整个可见球冠只选**单一 LOD**（一个 `targetZ`），可见半角靠 `pitchPad = min(pitch*0.5, 0.25)` 外扩。这个 `0.25 rad ≈ 14°` 的**限幅**是为防止瓦片数量爆炸而加的，但它同时让球冠在大俯仰时**够不到真实地平线**——可见瓦片集合的边界停在地平线之前，于是远端出现按整片瓦片裁出的阶梯边界。单 LOD 方案要铺到地平线就必须用统一的高层级覆盖巨大角范围，瓦片数会指数爆炸，本质上无法兼顾。
+
+### 11.3 修复方案：球体与倾斜平面统一走屏幕空间逐距离 LOD
+
+放弃「单 LOD 球冠 + 限幅 padding」，让球体复用第 8 节平面倾斜所用的 `TilePyramid.getVisibleTilesTilted`：
+
+- 在屏幕上撒网格采样点，每点用 `camera.unprojectToWorld` 做**射线-单位球求交**（globe 分支），落到世界坐标；越过地平线的采样点求交失败→跳过，天然以真实地平线为边界。
+- 用采样点与邻域像素的世界距离估算**该处每像素世界尺度**，反推**局部 LOD**：近处（视野底部）得到高层级，远处（趋近地平线）导数骤增→层级自动降低。**远端用粗瓦片**使瓦片总数被采样点数量上界约束，从而能**一路铺到地平线**而不爆炸。
+- 关键差异：`getVisibleTilesTilted` 原本把细节级上限 `hiZ` 限到 `round(camera.zoom)+1`；但 globe 的 `camera.zoom` 控制的是相机距离（`d=1+(d0-1)/2^zoom`）而非瓦片层级，其数值远低于实际所需 z。故 globe 模式下把 `hiZ` 放宽到 `maxZoom`，完全交给逐采样点的屏幕导数推算层级。
+- 瓦片铺到真实地平线后，第 10 节的解析覆盖（`h=0` 淡出）即可把这条边界平滑为干净的地平线，阶梯消失。混合 LOD 的瓦片坐标由 `onRender` 既有循环与 `_buildFallbackDraw` 逐坐标处理，无需额外改动。
+
+### 11.4 修改文件
+
+| 文件 | 修改要点 |
+| --- | --- |
+| `src/tile/TilePyramid.ts` | `getVisibleTilesTilted` 改为投影感知：globe 模式 `hiZ = maxZoom`（层级完全由屏幕导数决定），mercator 保持 `round(camZ)+1` |
+| `src/layers/RasterTileLayer.ts` | 球体瓦片选择改用 `getVisibleTilesTilted`（屏幕空间逐距离 LOD），删除旧的单 LOD `_getGlobeVisibleTiles` 与滞回字段 `_lastGlobeZ` |
+
+> 注：第 8 节描述的旧球体策略（`_getGlobeVisibleTiles` 单 LOD 球冠 + 限幅 pitchPad + `MAX_GLOBE_TILES` 上限）已被本节的屏幕空间逐距离 LOD 取代。
+
+### 11.5 验证
+
+`debug/events.html` → 「3D 球体」，zoom≈4、抬高俯仰角到 45°~60°（华南上空）：
+
+- **远端无阶梯**：远处 / 顶部瓦片覆盖应一路铺到地平线，边界为平滑曲线（由解析覆盖淡出），不再有整片瓦片台阶。
+- **远近清晰度合理**：近处瓦片清晰、远处自动降级为粗瓦片，无糊图。
+- **无回归**：轮廓仍平滑、底部无空洞、连续右键拖拽改变俯仰/方位角主线程保持流畅。
+
+## 12. 球体底部「空洞 / 黑弧」（背侧片元擦除前侧瓦片）
+
+### 12.1 问题现象
+
+3D 球体模式下，有一定俯仰角时，画面**底部中央**出现一片平滑的黑色弧形空洞——本应被前侧瓦片填满的可见球面区域显示为清空色（接近黑），且空洞会随俯仰角增大而向上吃掉更多有效地图区域。低俯仰角（如 6°）时表现为底部一条细黑弧。
+
+### 12.2 根因
+
+排查链（俯仰 45.8° 下逐项证伪）确认：可见性选择、瓦片就绪、`bindGroup`、前向投影、深度配置、中心列解析覆盖均正常——底部像素经 `unprojectToWorld` **确实命中前侧球面**（`h>0`）。最终定位到**管线与着色器的相互作用**：
+
+- 管线 `cullMode: 'none'`（为让横跨地平线的三角形也能光栅化、由解析覆盖淡出），于是**球体背侧（远侧半球）的瓦片片元也被绘制**。
+- 这些背侧片元在掠射角下会**投影到屏幕底部**，与前侧瓦片落在同一像素。
+- 第 10 节的解析覆盖只把背侧片元的 alpha 设为 ~0，却**没有阻止其写入**。在 premultiplied 混合 + 绘制顺序下，后绘制的背侧片元擦除 / 覆盖了先绘制的前侧瓦片，留下清空色 → 底部空洞。
+- 管线的 `depthStencil` 注释当时仍写着「远侧半球已由 `cullMode:'back'` 背面剔除」，与实际的 `cullMode:'none'` 自相矛盾——背面剔除的假设早已被去掉，却没有等价的替代机制兜底。
+
+调试验证：把片元强制输出不透明红 → 全屏铺满（几何无缺）；输出 `vec4(c.rgb,1.0)`（含背侧）→ 全屏有内容（背侧穿透）；可视化 `aa` → 底部为黑（`aa=0`）；`if(h<0){discard;}` 后输出前侧纹理 → 底部完整填充。逐项锁定为「背侧片元擦除前侧」。
+
+### 12.3 修复方案：丢弃越过地平线的背侧片元
+
+在 `raster.wgsl` 的 `fs_main` globe 分支里，对解析覆盖 `aa<=0`（即 `h<0`、完全位于地平线背侧）的片元直接 `discard`，使其**不参与合成、不写入颜色缓冲**，从而无法擦除前侧已绘制的瓦片；同时保留 `(0,1]` 区间的解析覆盖淡出，可见轮廓仍有约 1 像素的平滑边缘。
+
+```wgsl
+if (uGlobal.flags.x > 0.5) {
+    let h  = dot(in.sphere, uGlobal.eye.xyz) - 1.0;
+    let aa = clamp(h / fwidth(h) + 0.5, 0.0, 1.0);
+    if (aa <= 0.0) { discard; }   // 背侧片元丢弃，避免擦除前侧瓦片
+    a = a * aa;
+}
+```
+
+这等价于「逐片元背面剔除」，但比管线级 `cullMode:'back'` 更稳健：低层级兜底瓦片（如 z=0 整张世界）单片三角形会同时跨越前后半球，按缠绕方向整片剔除会误删，而逐片元按 `h` 判定则精确到像素。
+
+### 12.4 修改文件
+
+| 文件 | 修改要点 |
+| --- | --- |
+| `src/shaders/raster.wgsl.ts` | `fs_main` globe 分支在解析覆盖后增加 `if (aa <= 0.0) { discard; }`，丢弃地平线背侧片元 |
+| `src/layers/RasterTileLayer.ts` | 更正 `depthStencil` 注释：背侧剔除现由片元着色器 `discard` 承担，而非已不存在的 `cullMode:'back'` |
+
+### 12.5 验证
+
+`debug/index.html` → 「3D 球体」，zoom≈4，分别在低俯仰（~6°）与大俯仰（~46°）下：
+
+- **底部无空洞**：可见球面一路填满到真实地平线，底部不再出现黑色弧形空洞，地图内容铺满到平滑的球体边缘。
+- **轮廓平滑**：球体限缘（地平线 / 与太空交界）仍由解析覆盖抗锯齿，呈干净的平滑曲线。
+- **无回归**：远端无阶梯、限缘无锯齿、连续右键拖拽改变俯仰流畅。

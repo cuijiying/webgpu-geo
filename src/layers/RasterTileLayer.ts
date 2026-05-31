@@ -9,7 +9,7 @@ import { Tile, TileState } from '../tile/Tile';
 import { tileKey, type TileCoord } from '../geo/types';
 import { Mercator } from '../geo/Mercator';
 import { RASTER_TILE_WGSL } from '../shaders/raster.wgsl.ts';
-
+import { vec3 } from 'gl-matrix';
 /**
  * 栅格瓦片图层配置
  */
@@ -144,10 +144,10 @@ export class RasterTileLayer extends Layer {
     private _tileUbo!: GPUBuffer;
     private _tileUboCapacity = 0;
     private _scratch = new Float32Array(8);
-    /** 全局 UBO 临时缓冲：16 floats viewProj + 4 floats flags = 80 bytes */
-    private _globalScratch = new Float32Array(20);
-    /** globe 模式上一帧选定的瓦片层级，用于滞回，避免 0.5 边界处反复跳变 */
-    private _lastGlobeZ = -1;
+    /** 全局 UBO 临时缓冲：16 floats viewProj + 4 floats flags + 4 floats eye = 96 bytes */
+    private _globalScratch = new Float32Array(24);
+    /** globe 模式相机在基础球面空间的位置（每帧复用，免分配） */
+    private _eyeScratch = vec3.create();
     /**
      * 当前在途（Idle 入队 / Loading）但尚未 Ready 的瓦片集合。
      * 每帧渲染末尾，凡 `lastUsedFrame` 不等于当前帧、且未被钉固者，
@@ -207,7 +207,7 @@ export class RasterTileLayer extends Layer {
         // 全局 UBO：viewProj mat4 + flags vec4 = 80 bytes
         this._globalUbo = device.createBuffer({
             label: 'raster-global-ubo',
-            size: 80,
+            size: 96,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
@@ -276,15 +276,18 @@ export class RasterTileLayer extends Layer {
             },
             primitive: {
                 topology: 'triangle-list',
-                // 镶嵌 quad 的索引顺序是 CW（从屏幕外看）；球面也是 CW 朝外
-                // 因此把 CW 作为正面，背面（地球远侧）被剔除以提升性能
+                // 不做背面剔除：球体远侧半球本就不在瓦片选择集中；而横跨地平线的瓦片
+                // 需要把越过地平线的三角形也光栅化，交给片元着色器的「地平线解析覆盖」
+                // 平滑淡出（见 raster.wgsl fs_main）。若在此剔除背面，几何边界会恰好停在
+                // 地平线处，导致解析覆盖无法在可绘制区域内完整淡到 0，球体轮廓仍有锯齿。
                 frontFace: 'cw',
-                cullMode: 'back',
+                cullMode: 'none',
             },
             depthStencil: {
                 format: 'depth24plus',
                 // 不依赖深度缓冲做瓦片间遮挡：
-                //  - 球体远侧半球已由 cullMode:'back' 背面剔除；
+                //  - 球体远侧半球的背面片元由 raster.wgsl fs_main 按地平线解析覆盖
+                //    （h<0 → aa=0）直接 discard，不参与合成；
                 //  - 前侧半球的瓦片在球面上互不重叠，按绘制顺序合成即可。
                 // 若启用深度测试，相邻瓦片/不同细分级别的兜底瓦片会因球面三角
                 // 近似误差而发生 z-fighting，在掠射角（大 pitch）下表现为底部
@@ -326,11 +329,25 @@ export class RasterTileLayer extends Layer {
         this._globalScratch[17] = 0;
         this._globalScratch[18] = 0;
         this._globalScratch[19] = 0;
+        // globe 模式：写入基础球面空间的相机位置（供片元地平线解析抗锯齿）
+        if (isGlobe) {
+            camera.getGlobeEyeModel(this._eyeScratch);
+            this._globalScratch[20] = this._eyeScratch[0];
+            this._globalScratch[21] = this._eyeScratch[1];
+            this._globalScratch[22] = this._eyeScratch[2];
+            this._globalScratch[23] = 0;
+        }
         device.queue.writeBuffer(this._globalUbo, 0, this._globalScratch);
 
         // 2) 计算可见 ideal 瓦片
+        //    球体与倾斜平面统一走「屏幕空间采样 + 逐采样点 LOD」：
+        //    对每个屏幕采样点做反投影（球体=射线与单位球求交），用局部屏幕导数推算该处
+        //    应有的瓦片层级。远处（近地平线）导数骤增→自动选粗瓦片，既能一路铺到真实
+        //    地平线、又把瓦片数量控制在有限范围；地平线轮廓再由片元的解析覆盖平滑淡出。
         const idealCoords = isGlobe
-            ? this._getGlobeVisibleTiles(camera)
+            ? TilePyramid.getVisibleTilesTilted(
+                camera, this._source.minZoom, this._source.maxZoom,
+                window.devicePixelRatio || 1)
             : (camera.getPitch() !== 0 || camera.getBearing() !== 0)
                 // 倾斜/旋转：屏幕空间采样 + 逐瓦片 LOD，铺满梯形视野到地平线
                 ? TilePyramid.getVisibleTilesTilted(
@@ -506,144 +523,6 @@ export class RasterTileLayer extends Layer {
                 }
             }
         }
-    }
-
-    /**
-     * Globe 模式下的可见瓦片选择
-     *
-     * 算法：
-     *   1) targetZ = round(camera.zoom)
-     *   2) 计算可见角半径 = horizon angle + padding
-     *      horizon angle = acos(R / d)，R=1 是球半径，d 是相机距球心距离
-     *   3) 把可见角换算成 targetZ 下的瓦片半径（基于"每弧度对应多少瓦片"）
-     *   4) 仅枚举 center tile 周围这个矩形范围内的瓦片
-     *   5) 对每个候选瓦片用"瓦片中心到 view center 的球面距离"做最终精确剔除
-     *
-     * 这样既不会全图扫描（O(4^z) 太慢），又不会漏掉边缘瓦片。
-     */
-    private _getGlobeVisibleTiles(camera: import('../camera/Camera').Camera): TileCoord[] {
-        const center = camera.getCenter();
-        const d = camera.getGlobeDistance();
-        const horizonAng = Math.acos(Math.min(0.9999, 1 / d));
-        const fov = camera.getGlobeFovY();
-        const surfaceDist = Math.max(0.005, d - 1);
-
-        // ===== z 选择：以"屏幕像素密度反推"为权威，camera.zoom 仅作下限保护 =====
-        // globe 模式下 camera.zoom 控制的是距离公式 d=1+(d0-1)/2^zoom，
-        // 与 mercator 中"zoom=z 表示瓦片宽=viewport/2^z"完全不同：
-        //   zoom=2 时 d≈1.35，视口里可见弧长仅占赤道的 ~18%，需要 z≈6 的瓦片才能 1:1。
-        // 所以这里必须用 desiredZ（按 radPerPx 反算）作为渲染细节级，
-        // 否则远低于 desiredZ 会看到极度拉伸的糊图。
-        // 卡顿问题已由 fallback 节流 + Base 优先级 + prefetch 预算 解决，无需在此封顶。
-        const vh = Math.max(1, camera.viewportHeight);
-        const vw = Math.max(1, camera.viewportWidth);
-        const radPerPx = (surfaceDist * fov) / vh;
-        const desiredZ = Math.log2((2 * Math.PI) / Math.max(1e-9, 256 * radPerPx));
-        const camZ = camera.getZoom();
-        const idealF = Math.max(desiredZ, camZ);
-        const loZ = this._source.minZoom;
-        const hiZ = this._source.maxZoom;
-        // ===== 滞回（hysteresis）：用 ±0.6 死区 + 单步切换，避免缩放过程中 targetZ
-        //       在两个整数间反复跳变引发"请求一整套新瓦片→GPU 上传风暴→闪烁" =====
-        let targetZ: number;
-        if (this._lastGlobeZ < 0) {
-            targetZ = Math.round(idealF);
-        } else if (idealF > this._lastGlobeZ + 0.6) {
-            targetZ = this._lastGlobeZ + 1;   // 需要更清晰，升一级
-        } else if (idealF < this._lastGlobeZ - 0.6) {
-            targetZ = this._lastGlobeZ - 1;   // 可以更粗，降一级
-        } else {
-            targetZ = this._lastGlobeZ;       // 落在死区内，保持不变
-        }
-        targetZ = Math.max(loZ, Math.min(hiZ, targetZ));
-        this._lastGlobeZ = targetZ;
-        const n = 1 << targetZ;
-
-        // ===== 计算可视半角（弧度，球面中心角） =====
-        // 给定相机到球心 d、FOV 半角 α，球半径 1：
-        //   - 若 α >= asin(1/d)：视锥比切线还宽，能看到整个可见半球 → 使用 horizonAng
-        //   - 否则视锥与球面相交于 θ = atan2(t·sinα, d - t·cosα)，
-        //     其中 t = d·cosα − √(1 − d²sin²α)
-        const tangentHalfAng = Math.asin(Math.min(1, 1 / d));
-        const aspect = vw / vh;
-        const halfFovV = fov / 2;
-        const halfFovH = Math.atan(Math.tan(halfFovV) * aspect);
-        const visAngFor = (halfFov: number): number => {
-            if (halfFov >= tangentHalfAng) return horizonAng;
-            const sinA = Math.sin(halfFov);
-            const cosA = Math.cos(halfFov);
-            const disc = 1 - d * d * sinA * sinA;
-            if (disc <= 0) return horizonAng;
-            const t = d * cosA - Math.sqrt(disc);
-            const px = t * sinA;
-            const pz = d - t * cosA;
-            return Math.atan2(px, pz);
-        };
-        const visAngV = visAngFor(halfFovV);
-        const visAngH = visAngFor(halfFovH);
-        // 取较大者作为外接圆半径，再加一个瓦片角半径的 padding 防边缘漏裁。
-        // 俯仰（pitch）会让视线偏向地平线，可视球冠需沿俯仰方向略微外扩；
-        // 但必须**限幅**——直接叠加完整 pitch 会让可视半角剧增、瓦片数量爆炸，
-        // 在右键拖动连续改变 pitch 时引发请求风暴导致卡死。
-        const tileAngRadius = (Math.SQRT2 * Math.PI) / n;
-        const pitchPad = Math.min(camera.getPitch() * 0.5, 0.25);
-        const visAng = Math.min(
-            Math.PI,
-            Math.max(visAngV, visAngH) + pitchPad + 1.5 * tileAngRadius,
-        );
-
-        const tilesPerRad = n / (2 * Math.PI);
-        const tileRadius = Math.min(n, Math.ceil(visAng * tilesPerRad) + 1);
-
-        const cTile = Mercator.lngLatToTile(center, targetZ);
-        const cx = Math.floor(cTile.x);
-        const cy = Math.floor(cTile.y);
-
-        const minY = Math.max(0, cy - tileRadius);
-        const maxY = Math.min(n - 1, cy + tileRadius);
-
-        const centerLat = (center.lat * Math.PI) / 180;
-        const centerLng = (center.lng * Math.PI) / 180;
-        const sinCL = Math.sin(centerLat);
-        const cosCL = Math.cos(centerLat);
-        const cosVis = Math.cos(Math.min(Math.PI, visAng + tileAngRadius));
-
-        const out: TileCoord[] = [];
-        const seen = new Set<number>();
-        // 记录每个候选瓦片到 view center 的球面距离（cosD 越大越近），
-        // 超出预算时按"近的优先"截断，避免一次性请求过多瓦片造成卡死。
-        const cand: { x: number; y: number; cosD: number }[] = [];
-        for (let y = minY; y <= maxY; y++) {
-            for (let dx = -tileRadius; dx <= tileRadius; dx++) {
-                const rawX = cx + dx;
-                const x = ((rawX % n) + n) % n; // 经度环绕
-                // 去重（低 zoom 时 wrap 会让同一瓦片被多次枚举）
-                const id = y * n + x;
-                if (seen.has(id)) continue;
-                seen.add(id);
-                // 瓦片中心 → 经纬度
-                const wx = (x + 0.5) / n;
-                const wy = (y + 0.5) / n;
-                const ll = Mercator.worldToLngLat(wx, wy);
-                const lat = (ll.lat * Math.PI) / 180;
-                const lng = (ll.lng * Math.PI) / 180;
-                // cos(球面距离) = sinφ1 sinφ2 + cosφ1 cosφ2 cos(Δλ)
-                const cosD =
-                    sinCL * Math.sin(lat) +
-                    cosCL * Math.cos(lat) * Math.cos(lng - centerLng);
-                if (cosD >= cosVis) {
-                    cand.push({ x, y, cosD });
-                }
-            }
-        }
-        // 预算上限：球体一帧最多请求的 ideal 瓦片数，超出按近距优先截断。
-        const MAX_GLOBE_TILES = 200;
-        if (cand.length > MAX_GLOBE_TILES) {
-            cand.sort((a, b) => b.cosD - a.cosD);
-            cand.length = MAX_GLOBE_TILES;
-        }
-        for (const c of cand) out.push({ z: targetZ, x: c.x, y: c.y });
-        return out;
     }
 
     /**
