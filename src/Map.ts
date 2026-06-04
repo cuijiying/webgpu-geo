@@ -4,6 +4,7 @@ import { Camera, type ProjectionMode } from './camera/Camera';
 import { Layer } from './layers/Layer';
 import { RasterTileLayer } from './layers/RasterTileLayer';
 import { GeoJSONLayer, type GeoJSONLayerOptions } from './layers/GeoJSONLayer';
+import { GLTFLayer, type GLTFLayerOptions } from './layers/GLTFLayer';
 import { TileSource } from './tile/TileSource';
 import { MapInteraction } from './control/MapInteraction';
 import { MapEventManager } from './control/MapEvents';
@@ -141,6 +142,16 @@ export class Map extends Evented {
      */
     addGeoJSON(opts: GeoJSONLayerOptions): GeoJSONLayer {
         const layer = new GeoJSONLayer(opts);
+        this.renderer.addLayer(layer);
+        return layer;
+    }
+
+    /**
+     * 便捷加载并放置一个 glTF/glb 模型图层。
+     * 返回创建的 GLTFLayer，可用其 setPlacement 动态更新位置/朝向。
+     */
+    addGLTF(opts: GLTFLayerOptions): GLTFLayer {
+        const layer = new GLTFLayer(opts);
         this.renderer.addLayer(layer);
         return layer;
     }

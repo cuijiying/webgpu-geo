@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>webgpu-geo · glTF / glb 模型图层</title>
+    <style>
+        html, body { margin: 0; padding: 0; height: 100%; background: #0c1014; overflow: hidden; }
+        #map { width: 100%; height: 100%; display: block; }
+        .hud {
+            position: absolute; top: 10px; left: 10px;
+            background: rgba(0,0,0,.65); color: #fff;
+            padding: 12px 14px; border-radius: 8px;
+            font: 12px/1.6 -apple-system, "Segoe UI", sans-serif;
+            user-select: none; width: 250px;
+        }
+        .hud b { color: #6cf; }
+        .hud h3 { margin: 0 0 8px; font-size: 13px; color: #9fe; }
+        .hud .row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+        .hud button {
+            cursor: pointer; border: 1px solid #345; background: #1a2530;
+            color: #cdf; border-radius: 5px; padding: 4px 8px; font-size: 12px;
+        }
+        .hud button:hover { background: #25323f; }
+        .hud label { display: block; margin-top: 8px; }
+        .hud input[type=range] { width: 100%; accent-color: #3bb2d0; }
+        .info { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2a3a47; }
+    </style>
+</head>
+<body>
+    <canvas id="map"></canvas>
+    <div class="hud">
+        <h3>glTF / glb 模型图层</h3>
+        <div>拖拽平移 · 滚轮缩放</div>
+        <div class="info">
+            center: <b id="center">-</b><br>
+            zoom: <b id="zoom">-</b> · proj: <b id="proj">-</b><br>
+            model: <b id="status">加载中…</b>
+        </div>
+        <div class="row">
+            <button id="btn-2d">2D 平面</button>
+            <button id="btn-3d">3D 球体</button>
+        </div>
+        <label>缩放 scale: <b id="v-scale">200</b>
+            <input type="range" id="r-scale" min="10" max="2000" value="200">
+        </label>
+        <label>朝向 heading: <b id="v-head">0</b>°
+            <input type="range" id="r-head" min="0" max="360" value="0">
+        </label>
+        <label>俯仰 pitch: <b id="v-pitch">0</b>°
+            <input type="range" id="r-pitch" min="-90" max="90" value="0">
+        </label>
+        <div class="row">
+            <button id="btn-fly">飞到模型</button>
+        </div>
+    </div>
+
+    <script>document.write('<script src="../dist/aimap-dev.umd.js?v=' + Date.now() + '"><\/script>');</script>
+    <script>
+    (async function () {
+        const MODEL_LNG = 116.4074, MODEL_LAT = 39.9042;
+
+        const map = new ai.Map({
+            container: 'map',
+            center: { lng: MODEL_LNG, lat: MODEL_LAT },
+            zoom: 16,
+            minZoom: 0,
+            maxZoom: 20,
+            projection: 'globe',
+            tileSource: {
+                url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                subdomains: ['a', 'b', 'c']
+            }
+        });
+        await map.ready();
+
+        // ---------- 添加 glTF 模型图层 ----------
+        const gltf = map.addGLTF({
+            url: 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Duck/glTF-Binary/Duck.glb',
+            lng: MODEL_LNG,
+            lat: MODEL_LAT,
+            altitude: 0,
+            heading: 0,
+            scale: 200
+        });
+        gltf.on('load', () => { document.getElementById('status').textContent = '已加载 ✓'; });
+        gltf.on('error', (e) => { document.getElementById('status').textContent = '加载失败'; console.error(e.error); });
+
+        // ---------- HUD ----------
+        const $c = document.getElementById('center');
+        const $z = document.getElementById('zoom');
+        const $p = document.getElementById('proj');
+        function updateHud() {
+            const c = map.getCenter();
+            $c.textContent = c.lng.toFixed(4) + ', ' + c.lat.toFixed(4);
+            $z.textContent = map.getZoom().toFixed(2);
+            $p.textContent = map.getProjection();
+        }
+        map.camera.onChange(updateHud);
+        updateHud();
+
+        document.getElementById('btn-2d').onclick = () => map.setProjection('mercator');
+        document.getElementById('btn-3d').onclick = () => map.setProjection('globe');
+
+        let scale = 200, heading = 0, pitch = 0;
+        const rScale = document.getElementById('r-scale');
+        const rHead = document.getElementById('r-head');
+        const rPitch = document.getElementById('r-pitch');
+        rScale.oninput = (e) => { scale = +e.target.value; document.getElementById('v-scale').textContent = scale; gltf.setPlacement({ scale }); };
+        rHead.oninput = (e) => { heading = +e.target.value; document.getElementById('v-head').textContent = heading; gltf.setPlacement({ heading }); };
+        rPitch.oninput = (e) => { pitch = +e.target.value; document.getElementById('v-pitch').textContent = pitch; gltf.setPlacement({ pitch }); };
+
+        document.getElementById('btn-fly').onclick = () => {
+            map.setCenter({ lng: MODEL_LNG, lat: MODEL_LAT });
+            map.setZoom(16);
+        };
+
+        window.map = map;
+        window.gltf = gltf;
+    })().catch(function (err) {
+        document.body.innerHTML = '<div style="color:#fff;padding:24px;font-family:sans-serif">' +
+            '<h2>初始化失败</h2><pre>' + err.stack + '</pre></div>';
+    });
+    </script>
+</body>
+</html>

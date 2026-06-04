@@ -6,6 +6,14 @@ export { Camera, type ProjectionMode } from './camera/Camera';
 export { Layer } from './layers/Layer';
 export { RasterTileLayer, type RasterTileLayerOptions } from './layers/RasterTileLayer';
 export { GeoJSONLayer, type GeoJSONLayerOptions, type GeoJSONPaint } from './layers/GeoJSONLayer';
+export { GLTFLayer, type GLTFLayerOptions } from './layers/GLTFLayer';
+export { loadGltf, type GltfLoadOptions } from './gltf/GLTFLoader';
+export {
+    buildPlacementGlobe, buildPlacementMercator, lngLatHeightToEcef,
+    WGS84_A, WGS84_B, WGS84_E2,
+    type PlacementParams, type PlacementMatrices,
+} from './gltf/geo';
+export type { ParsedModel, ParsedPrimitive } from './gltf/gltf-types';
 export { GeoJSONSource } from './geojson/GeoJSONSource';
 export { parseColor, type RGBA } from './geojson/color';
 export { earcut } from './geojson/earcut';
